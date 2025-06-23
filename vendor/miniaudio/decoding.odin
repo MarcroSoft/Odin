@@ -162,3 +162,20 @@ foreign lib {
 	decode_file     :: proc(pFilePath: cstring,                pConfig: ^decoder_config, pFrameCountOut: ^u64, ppPCMFramesOut: ^rawptr) -> result ---
 	decode_memory   :: proc(pData: rawptr, dataSize: c.size_t, pConfig: ^decoder_config, pFrameCountOut: ^u64, ppPCMFramesOut: ^rawptr) -> result ---
 }
+
+
+@(default_calling_convention="c", link_prefix="ma_")
+foreign lib {
+	decoding_backend_init__libopus :: proc(pUserData: rawptr, onRead: decoder_read_proc, onSeek: decoder_seek_proc, onTell: decoder_tell_proc, pReadSeekTellUserData: rawptr, pConfig: ^decoding_backend_config, pAllocationCallbacks: ^allocation_callbacks, ppBackend: ^^data_source) -> result ---
+	decoding_backend_init_file__libopus :: proc(pUserData: rawptr, pFilePath: cstring, pConfig: ^decoding_backend_config, pAllocationCallbacks: ^allocation_callbacks, ppBackend: ^^data_source) -> result ---
+	decoding_backend_uninit__libopus :: proc(pUserData: rawptr, pBackend: ^data_source, pAllocationCallbacks: ^allocation_callbacks) ---
+}
+
+
+decoding_backend_vtable_libopus: decoding_backend_vtable = {
+    decoding_backend_init__libopus,
+    decoding_backend_init_file__libopus,
+    nil,
+    nil,
+    decoding_backend_uninit__libopus
+};
