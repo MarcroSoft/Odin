@@ -12,7 +12,7 @@ LUA_SHARED :: #config(LUA_SHARED, false)
 when LUA_SHARED {
 	when ODIN_OS == .Windows {
 		// LUA_SHARED does nothing special on windows
-		foreign import lib "windows/lua54dll.lib"
+		foreign import lib "windows/lua.lib"
 	} else when ODIN_OS == .Linux {
 		foreign import lib "linux/liblua54.so"
 	} else {
@@ -20,7 +20,7 @@ when LUA_SHARED {
 	}
 } else {
 	when ODIN_OS == .Windows {
-		foreign import lib "windows/lua54dll.lib"
+		foreign import lib "windows/lua.lib"
 	} else when ODIN_OS == .Linux {
 		foreign import lib "linux/liblua54.a"
 	} else {
