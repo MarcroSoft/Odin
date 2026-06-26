@@ -162,3 +162,8 @@ foreign lib {
 	decode_file     :: proc(pFilePath: cstring,                pConfig: ^decoder_config, pFrameCountOut: ^u64, ppPCMFramesOut: ^rawptr) -> result ---
 	decode_memory   :: proc(pData: rawptr, dataSize: c.size_t, pConfig: ^decoder_config, pFrameCountOut: ^u64, ppPCMFramesOut: ^rawptr) -> result ---
 }
+@(default_calling_convention="c")
+foreign lib {
+    // VTable defineret i C
+    ma_decoding_backend_libopus: ^decoding_backend_vtable;
+}
