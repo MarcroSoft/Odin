@@ -60,6 +60,8 @@ gb_global BuiltinTypeIsProc *builtin_type_is_procs[BuiltinProc__type_simple_bool
 	is_type_raw_union,
 	is_type_fixed_capacity_dynamic_array,
 
+	is_type_internally_pointer_like,
+
 	is_type_polymorphic_record_specialized,
 	is_type_polymorphic_record_unspecialized,
 
@@ -763,8 +765,10 @@ gb_internal bool check_builtin_c_procedure(CheckerContext *c, Operand *operand, 
 			return false;
 		}
 
+		c->allow_c_vararg_param = true;
 		Operand args = {};
 		check_expr(c, &args, ce->args[1]);
+		c->allow_c_vararg_param = false;
 		if (list.mode == Addressing_Invalid) {
 			return false;
 		}
@@ -7060,6 +7064,8 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 	case BuiltinProc_type_is_simd_vector:
 	case BuiltinProc_type_is_matrix:
 	case BuiltinProc_type_is_raw_union:
+	case BuiltinProc_type_is_fixed_capacity_dynamic_array:
+	case BuiltinProc_type_is_internally_pointer_like:
 	case BuiltinProc_type_is_specialized_polymorphic_record:
 	case BuiltinProc_type_is_unspecialized_polymorphic_record:
 	case BuiltinProc_type_has_nil:
