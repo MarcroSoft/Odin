@@ -4,7 +4,9 @@ set -eu
 mkdir -p build
 pushd build
 ODIN=../../../odin
-COMMON="-define:ODIN_TEST_FANCY=false -file -vet -strict-style -ignore-unused-defineables"
+COMMON="-define:ODIN_TEST_FANCY=false -file -vet -strict-style -ignore-unused-defineables -microarch:native"
+COMMON_CHECK="-define:ODIN_TEST_FANCY=false -file -vet -strict-style -ignore-unused-defineables"
+
 
 set -x
 
@@ -32,6 +34,12 @@ $ODIN build ../test_issue_5043.odin $COMMON
 $ODIN build ../test_issue_5097.odin $COMMON
 $ODIN build ../test_issue_5097-2.odin $COMMON
 $ODIN build ../test_issue_5265.odin $COMMON
+if [[ $($ODIN build ../test_issue_5573.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 2 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
 $ODIN test ../test_issue_5699.odin $COMMON
 $ODIN test ../test_issue_6068.odin $COMMON
 $ODIN test ../test_issue_6101.odin $COMMON
@@ -65,6 +73,7 @@ else
 	echo "SUCCESSFUL 0/1"
 	exit 1
 fi
+$ODIN test ../test_issue_6419.odin $COMMON
 $ODIN test ../test_pr_6470.odin $COMMON
 if [[ $($ODIN test ../test_pr_6470.odin -define:TEST_EXPECT_FAILURE=true $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]] ; then
 	echo "SUCCESSFUL 1/1"
@@ -72,12 +81,43 @@ else
 	echo "SUCCESSFUL 0/1"
 	exit 1
 fi
-$ODIN check ../test_issue_6484.odin -no-entry-point $COMMON
-if [[ $($ODIN check ../test_issue_6874.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]] ; then
+$ODIN check ../test_issue_6484.odin -no-entry-point $COMMON_CHECK
+$ODIN test ../test_issue_6753.odin $COMMON
+if [[ $($ODIN check ../test_issue_6874.odin $COMMON_CHECK 2>&1 >/dev/null | grep -c "Error:") -eq 1 ]] ; then
 	echo "SUCCESSFUL 1/1"
 else
 	echo "SUCCESSFUL 0/1"
 	exit 1
+fi
+$ODIN check ../test_issue_6979.odin -no-entry-point $COMMON_CHECK
+$ODIN build ../test_issue_7037.odin $COMMON -o:none
+$ODIN build ../test_issue_7167.odin $COMMON
+
+if [[ $($ODIN build ../test_issue_7108.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 2 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+
+if [[ $($ODIN build ../test_issue_7073-1.odin $COMMON 2>&1 >/dev/null | grep -c "Error:") -eq 2 ]] ; then
+	echo "SUCCESSFUL 1/1"
+else
+	echo "SUCCESSFUL 0/1"
+	exit 1
+fi
+
+clang -c ../test_issue_7010.c -o test_issue_7010_c.o
+$ODIN test ../test_issue_7010.odin $COMMON
+
+clang -c ../test_issue_6809_6816.c -o test_issue_6809_6816_c.o -O3
+$ODIN test ../test_issue_6809_6816.odin -o:speed $COMMON
+
+clang -c ../test_issue_5640.c -o test_issue_5640_c.o
+if [[ "$(uname)" != "NetBSD" ]]; then
+	$ODIN test ../test_issue_5640.odin -o:none --sanitize:address $COMMON
+else
+	$ODIN test ../test_issue_5640.odin -o:none $COMMON
 fi
 
 set +x

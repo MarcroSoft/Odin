@@ -1764,7 +1764,10 @@ gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_
 			check_assignment(ctx, &o, in_type, str_lit("parameter value"));
 		}
 	} else {
-		if (in_type) {
+		expr = unparen_expr(expr);
+		if (expr && expr->kind == Ast_Uninit) {
+			error(expr, "Default parameter cannot be ---");
+		} else if (in_type) {
 			check_expr_with_type_hint(ctx, &o, expr, in_type);
 		} else {
 			check_expr(ctx, &o, expr);
@@ -1788,6 +1791,7 @@ gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_
 					if (e->kind == Entity_Procedure) {
 						param_value.kind = ParameterValue_Constant;
 						param_value.value = exact_value_procedure(e->identifier);
+						param_value.proc_entity = e;
 						add_entity_use(ctx, e->identifier, e);
 					} else {
 						if (e->flags & EntityFlag_Param) {
@@ -2140,8 +2144,12 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 						// This is just to add the error message to determine_type_from_polymorphic which
 						// depends on valid position information
 						op.expr = _params;
-						op.mode = Addressing_Invalid;
-						op.type = t_invalid;
+
+						// NOTE(taylbr): Can still have valid type with null expr. Needed for resolving
+						if (op.mode == Addressing_Invalid || op.type == nullptr) {
+							op.mode = Addressing_Invalid;
+							op.type = t_invalid;
+						}
 					}
 					if (is_type_polymorphic_type) {
 						type = determine_type_from_polymorphic(ctx, type, op);
@@ -2174,6 +2182,10 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 						if (!valid) {
 							if (op.mode == Addressing_Constant) {
 								poly_const = op.value;
+								if (poly_const.kind == ExactValue_Integer && is_type_float(type)) {
+									poly_const.kind = ExactValue_Float;
+									poly_const.value_float = big_int_to_f64(&poly_const.value_integer);
+								}
 							} else {
 								if (!ctx->in_proc_group) {
 									error(op.expr, "Expected a constant value for this polymorphic name parameter, got %s", expr_to_string(op.expr));
@@ -2221,8 +2233,13 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 				}
 
 				if (p->flags&FieldFlag_no_alias) {
-					if (!is_type_pointer(type) && !is_type_multi_pointer(type)) {
-						error(name, "'#no_alias' can only be applied pointer or multi-pointer typed parameters");
+					// If type == t_invalid, we either already errored (and erroring again here is just log
+					// noise) or we are rejecting a polymorphic proc group overload candidate.
+					// If no_polymorphic_errors is set, we are speculatively checking a candidate and
+					// erroring+stripping is premature: the chosen candidate will be re-checked with errors enabled,
+					// so a true error isn't lost.
+					if (type != t_invalid && !is_type_internally_pointer_like(type) && !ctx->no_polymorphic_errors) {
+						error(name, "'#no_alias' can only be applied to pointer-like type parameters");
 						p->flags &= ~FieldFlag_no_alias; // Remove the flag
 					}
 				}
@@ -3109,14 +3126,14 @@ gb_internal void check_matrix_type(CheckerContext *ctx, Type **type, Ast *node) 
 			error(node, "Invalid matrix column count, got nothing");
 		} else {
 			gbString s = expr_to_string(column.expr);
-			error(column.expr, "Invalid matrix column count, expected %d+ rows, got %s", MATRIX_ELEMENT_COUNT_MIN, s);
+			error(column.expr, "Invalid matrix column count, expected %d+ columns, got %s", MATRIX_ELEMENT_COUNT_MIN, s);
 			gb_string_free(s);
 		}
 	}
 	
 	if ((generic_row == nullptr && generic_column == nullptr) && row_count*column_count > MATRIX_ELEMENT_COUNT_MAX) {
 		i64 element_count = row_count*column_count;
-		error(column.expr, "Matrix types are limited to a maximum of %d elements, got %lld", MATRIX_ELEMENT_COUNT_MAX, cast(long long)element_count);
+		error(node, "Matrix types are limited to a maximum of %d elements, got %lld", MATRIX_ELEMENT_COUNT_MAX, cast(long long)element_count);
 	}
 
 

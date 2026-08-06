@@ -1109,7 +1109,6 @@ gb_internal i64 odin_compile_timestamp(void) {
 	return ns_after_1970;
 }
 
-gb_internal bool lb_use_new_pass_system(void);
 
 gb_internal void init_universal(void) {
 	BuildContext *bc = &build_context;
@@ -1247,6 +1246,7 @@ gb_internal void init_universal(void) {
 			{"iPhone",          Subtarget_iPhone},
 			{"iPhoneSimulator", Subtarget_iPhoneSimulator},
 			{"Android",         Subtarget_Android},
+			{"Playdate",        Subtarget_Playdate},
 		};
 
 		auto fields = add_global_enum_type(str_lit("Odin_Platform_Subtarget_Type"), values, gb_count_of(values));
@@ -1382,7 +1382,8 @@ gb_internal void init_universal(void) {
 	}
 
 	{
-		bool f16_supported = lb_use_new_pass_system();
+		// Available since LLVM 17 / new pass system, which is the minimum now.
+		bool f16_supported = true;
 		if (is_arch_wasm()) {
 			f16_supported = false;
 		} else if (build_context.metrics.os == TargetOs_darwin && build_context.metrics.arch == TargetArch_amd64) {
@@ -5646,7 +5647,7 @@ gb_internal void check_add_import_decl(CheckerContext *ctx, Ast *decl) {
 		ERROR_BLOCK();
 
 		if (id->import_name.string.len > 0) {
-			error(token, "Import name '%.*s' cannot be use as an import name as it is not a valid identifier", LIT(id->import_name.string));
+			error(token, "Import name '%.*s' is not a valid identifier", LIT(id->import_name.string));
 		} else {
 			error(id->token, "Import name '%.*s' is not a valid identifier", LIT(invalid_name));
 			error_line("\tSuggestion: Rename the directory or explicitly set an import name like this 'import <new_name> %.*s'", LIT(id->relpath.string));
@@ -6734,8 +6735,11 @@ gb_internal bool consume_proc_info(Checker *c, ProcInfo *pi, UntypedExprInfoMap 
 		// This is prevent any possible race conditions in evaluation when multithreaded
 		// NOTE(bill): In single threaded mode, this should never happen
 		if (parent->kind == Entity_Procedure && (parent->flags & EntityFlag_ProcBodyChecked) == 0) {
-			check_procedure_later(c, pi);
-			return false;
+			Type *pt = base_type(parent->type);
+			if (!pt->Proc.is_polymorphic || pt->Proc.is_poly_specialized) {
+				check_procedure_later(c, pi);
+				return false;
+			}
 		}
 	}
 	if (untyped) {
@@ -6769,8 +6773,11 @@ gb_internal WORKER_TASK_PROC(check_proc_info_worker_proc) {
 		// This is prevent any possible race conditions in evaluation when multithreaded
 		// NOTE(bill): In single threaded mode, this should never happen
 		if (parent->kind == Entity_Procedure && (parent->flags & EntityFlag_ProcBodyChecked) == 0) {
-			thread_pool_add_task(check_proc_info_worker_proc, pi);
-			return 1;
+			Type *pt = base_type(parent->type);
+			if (!pt->Proc.is_polymorphic || pt->Proc.is_poly_specialized) {
+				thread_pool_add_task(check_proc_info_worker_proc, pi);
+				return 1;
+			}
 		}
 	}
 	map_clear(untyped);
@@ -6883,6 +6890,13 @@ gb_internal void check_deferred_procedures(Checker *c) {
 			continue;
 		}
 
+		if (entity_has_deferred_procedure(dst)) {
+			error(src->token,
+			      "Deferred procedure '%.*s' cannot be used as the target of '%.*s' because it has a deferred procedure itself (deferred procedure chaining is not allowed)",
+			      LIT(dst->token.string), LIT(src->token.string));
+			continue;
+		}
+
 		if (is_type_polymorphic(src->type) || is_type_polymorphic(dst->type)) {
 			error(src->token, "'%s' cannot be used with a polymorphic procedure", attribute);
 			continue;
@@ -6894,7 +6908,10 @@ gb_internal void check_deferred_procedures(Checker *c) {
 			continue;
 		}
 
-		GB_ASSERT(is_type_proc(src->type));
+		if (!is_type_proc(src->type)) {
+			error(src->token, "Invalid procedure type found during deferred procedure checking");
+			continue;
+		}
 		GB_ASSERT(is_type_proc(dst->type));
 		Type *src_params = base_type(src->type)->Proc.params;
 		Type *src_results = base_type(src->type)->Proc.results;
