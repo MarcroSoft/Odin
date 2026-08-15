@@ -1024,10 +1024,16 @@ gb_internal lbValue lb_emit_call_internal(lbProcedure *p, lbValue value, lbValue
 		}
 
 		for_array(i, ft->args) {
+			// lbArg_Ignore args are not present in the call arguments, so they must not
+			// advance param_offset (mirrors lb_add_function_type_attributes)
+			if (ft->args[i].kind == lbArg_Ignore) {
+				continue;
+			}
 			LLVMAttributeRef attribute = ft->args[i].attribute;
 			if (attribute != nullptr) {
-				LLVMAddCallSiteAttribute(ret, param_offset + cast(LLVMAttributeIndex)i, attribute);
+				LLVMAddCallSiteAttribute(ret, param_offset, attribute);
 			}
+			param_offset += 1;
 		}
 
 		switch (inlining) {
@@ -1604,7 +1610,6 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 	case BuiltinProc_simd_sub:
 	case BuiltinProc_simd_mul:
 	case BuiltinProc_simd_div:
-	case BuiltinProc_simd_rem:
 		if (is_float) {
 			switch (builtin_id) {
 			case BuiltinProc_simd_add: op_code = LLVMFAdd; break;
@@ -1622,13 +1627,6 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 					op_code = LLVMSDiv;
 				} else {
 					op_code = LLVMUDiv;
-				}
-				break;
-			case BuiltinProc_simd_rem:
-				if (is_signed) {
-					op_code = LLVMSRem;
-				} else {
-					op_code = LLVMURem;
 				}
 				break;
 			}

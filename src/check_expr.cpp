@@ -735,35 +735,38 @@ gb_internal i64 check_distance_between_types(CheckerContext *c, Operand *operand
 			if (operand->mode == Addressing_Constant) {
 				if (check_representable_as_constant(c, operand->value, dst, nullptr)) {
 					if (is_type_typed(dst) && src->kind == Type_Basic) {
+						// NOTE: prefer the untyped constant's default type (int, f64, string, bool,
+						// rune) over other members of the same family, so a call like g(1) picks
+						// `int` over `i64` instead of scoring them identically and going ambiguous.
 						switch (src->Basic.kind) {
 						case Basic_UntypedBool:
 							if (is_type_boolean(dst)) {
-								return 1;
+								return are_types_identical(dst, default_type(src)) ? 1 : 2;
 							}
 							break;
 						case Basic_UntypedRune:
 							if (is_type_integer(dst) || is_type_rune(dst)) {
-								return 1;
+								return are_types_identical(dst, default_type(src)) ? 1 : 2;
 							}
 							break;
 						case Basic_UntypedInteger:
 							if (is_type_integer(dst) || is_type_rune(dst)) {
-								return 1;
+								return are_types_identical(dst, default_type(src)) ? 1 : 2;
 							}
 							break;
 						case Basic_UntypedString:
 							if (is_type_string(dst)) {
-								return 1;
+								return are_types_identical(dst, default_type(src)) ? 1 : 2;
 							}
 							break;
 						case Basic_UntypedFloat:
 							if (is_type_float(dst)) {
-								return 1;
+								return are_types_identical(dst, default_type(src)) ? 1 : 2;
 							}
 							break;
 						case Basic_UntypedComplex:
 							if (is_type_complex(dst)) {
-								return 1;
+								return are_types_identical(dst, default_type(src)) ? 1 : 2;
 							}
 							if (is_type_quaternion(dst)) {
 								return 2;
@@ -771,12 +774,13 @@ gb_internal i64 check_distance_between_types(CheckerContext *c, Operand *operand
 							break;
 						case Basic_UntypedQuaternion:
 							if (is_type_quaternion(dst)) {
-								return 1;
+								return are_types_identical(dst, default_type(src)) ? 1 : 2;
 							}
 							break;
 						}
 					}
-					return 2;
+					// A cross-family constant conversion ranks below a same-family one.
+					return 3;
 				}
 				return -1;
 			}
@@ -2302,7 +2306,15 @@ gb_internal bool check_representable_as_constant(CheckerContext *c, ExactValue i
 		if (in_value.kind == ExactValue_String16) {
 			return is_type_string16(type) || is_type_cstring16(type);
 		}
-		return in_value.kind == ExactValue_String;
+		if (in_value.kind != ExactValue_String) {
+			return false;
+		}
+		// NOTE: a UTF-8 constant has to be re-expressed in UTF-16, otherwise its length and
+		// indices stay those of the UTF-8 encoding
+		if (is_type_string16(type) || is_type_cstring16(type)) {
+			if (out_value) *out_value = exact_value_string16(string_to_string16(permanent_allocator(), in_value.value_string));
+		}
+		return true;
 	} else if (is_type_integer(type) || is_type_rune(type)) {
 		ExactValue v = exact_value_to_integer(in_value);
 		if (v.kind != ExactValue_Integer) {
@@ -2969,13 +2981,36 @@ gb_internal void check_unary_expr(CheckerContext *c, Operand *o, Token op, Ast *
 			return;
 		}
 
-		if (o->mode == Addressing_SoaVariable) {
+		Type *soa_for_in_type = nullptr;
+		if (node->kind == Ast_UnaryExpr) {
 			ast_node(ue, UnaryExpr, node);
-			if (ast_node_expect(ue->expr, Ast_IndexExpr)) {
-				ast_node(ie, IndexExpr, ue->expr);
+			Entity *e = entity_of_node(ue->expr);
+			if (e != nullptr && e->kind == Entity_Variable &&
+			    (e->flags & EntityFlag_SoaPtrField) != 0 &&
+			    e->Variable.for_loop_parent_type != nullptr) {
+				Type *soa_type = type_deref(e->Variable.for_loop_parent_type);
+				if (is_type_soa_struct(soa_type)) {
+					soa_for_in_type = soa_type;
+				}
+			}
+		}
+
+		if (soa_for_in_type != nullptr) {
+			// &v in for-in loop over #soa container
+			o->type = alloc_type_soa_pointer(soa_for_in_type);
+		} else if (o->mode == Addressing_SoaVariable) {
+			ast_node(ue, UnaryExpr, node);
+			Ast *index_expr = unparen_expr(ue->expr);
+			if (ast_node_expect(index_expr, Ast_IndexExpr)) {
+				ast_node(ie, IndexExpr, index_expr);
 				Type *soa_type = type_deref(type_of_expr(ie->expr));
-				GB_ASSERT(is_type_soa_struct(soa_type));
-				o->type = alloc_type_soa_pointer(soa_type);
+				if (is_type_soa_struct(soa_type)) {
+					o->type = alloc_type_soa_pointer(soa_type);
+				} else {
+					// &soa[i][j]
+					GB_ASSERT_MSG(is_type_array(soa_type), "%s", type_to_string(soa_type));
+					o->type = alloc_type_pointer(o->type);
+				}
 			} else {
 				o->type = alloc_type_pointer(o->type);
 			}
@@ -3947,7 +3982,7 @@ gb_internal void check_cast(CheckerContext *c, Operand *x, Type *type, bool forb
 				add_package_dependency(c, "runtime", "floattidf",          REQUIRE);
 			} else if (is_type_integer_128bit(dst) && is_type_float(src)) {
 				add_package_dependency(c, "runtime", "fixunsdfti",         REQUIRE);
-				add_package_dependency(c, "runtime", "fixunsdfdi",         REQUIRE);
+				add_package_dependency(c, "runtime", "fixdfti",            REQUIRE);
 			} else if (src == t_f16 && is_type_float(dst)) {
 				add_package_dependency(c, "runtime", "gnu_h2f_ieee",       REQUIRE);
 				add_package_dependency(c, "runtime", "extendhfsf2",        REQUIRE);
@@ -3983,14 +4018,15 @@ gb_internal void check_cast(CheckerContext *c, Operand *x, Type *type, bool forb
 		Type *dst = core_type(type);
 
 		if (is_type_string(src) && is_type_string(dst)) {
-			bool src_utf16 = is_type_string16(src) || is_type_cstring16(src);
 			bool dst_utf16 = is_type_string16(dst) || is_type_cstring16(dst);
 
-			if (!src_utf16 && dst_utf16) {
+			// NOTE: keyed off the value's encoding rather than the source type; it may have been re-expressed 
+			// when it was checked against the target type
+			if (dst_utf16 && x->value.kind == ExactValue_String) {
 				x->value = exact_value_string16(string_to_string16(permanent_allocator(), x->value.value_string));
 			}
 
-			if (src_utf16 && !dst_utf16) {
+			if (!dst_utf16 && x->value.kind == ExactValue_String16) {
 				x->value = exact_value_string(string16_to_string(permanent_allocator(), x->value.value_string16));
 			}
 		}
@@ -4082,7 +4118,7 @@ gb_internal bool check_transmute(CheckerContext *c, Ast *node, Operand *o, Type 
 				big_int_shl_eq(&umax, &sz_in_bits);
 
 				if (is_type_unsigned(src_t) && !is_type_unsigned(dst_t)) {
-					if (big_int_cmp(&v, &smax) >= 0) {
+					if (big_int_cmp(&v, &smax) > 0) {
 						big_int_sub_eq(&v, &umax);
 					}
 				} else if (!is_type_unsigned(src_t) && is_type_unsigned(dst_t)) {
@@ -4179,8 +4215,9 @@ gb_internal Type *check_matrix_type_hint(Type *matrix, Type *type_hint) {
 		} else if (xt->kind == Type_Matrix && th->kind == Type_Matrix) {
 			if (!are_types_identical(xt->Matrix.elem, th->Matrix.elem)) {
 				// ignore
-			} if (xt->Matrix.row_count == th->Matrix.row_count &&
-			      xt->Matrix.column_count == th->Matrix.column_count) {
+			} else if (xt->Matrix.row_count == th->Matrix.row_count &&
+			           xt->Matrix.column_count == th->Matrix.column_count &&
+			           xt->Matrix.is_row_major == th->Matrix.is_row_major) {
 				return type_hint;
 			}
 		} else if (xt->kind == Type_Matrix && th->kind == Type_Array) {
@@ -4232,8 +4269,22 @@ gb_internal void check_binary_matrix(CheckerContext *c, Token const &op, Operand
 						x->type = y->type;
 					}
 				} else {
+					// the result takes its rows from one operand and its columns from the other,
+					// so it can be larger than either. Each dimension is at least
+					// MATRIX_ELEMENT_COUNT_MIN, so testing them first keeps the product in range.
+					i64 row_count    = xt->Matrix.row_count;
+					i64 column_count = yt->Matrix.column_count;
+					if (row_count    > MATRIX_ELEMENT_COUNT_MAX ||
+					    column_count > MATRIX_ELEMENT_COUNT_MAX ||
+					    row_count*column_count > MATRIX_ELEMENT_COUNT_MAX) {
+						error(x->expr, "Matrix multiplication result exceeds the maximum matrix element count, got %lld, expected a maximum of %d", cast(long long)(row_count*column_count), MATRIX_ELEMENT_COUNT_MAX);
+						x->mode = Addressing_Invalid;
+						x->type = t_invalid;
+						return;
+					}
+
 					bool is_row_major = xt->Matrix.is_row_major && yt->Matrix.is_row_major;
-					x->type = alloc_type_matrix(xt->Matrix.elem, xt->Matrix.row_count, yt->Matrix.column_count, nullptr, nullptr, is_row_major);
+					x->type = alloc_type_matrix(xt->Matrix.elem, row_count, column_count, nullptr, nullptr, is_row_major);
 				}
 				goto matrix_success;
 			} else if (yt->kind == Type_Array) {
@@ -7008,6 +7059,11 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 						error(o->expr, "'..' in a variadic procedure can only have one variadic argument at the end");
 					}
 					if (data) {
+						// A synthesised default argument is not evidence of a better match: it
+						// contributes assign_score_function(1) as a dummy bonus and is then scored
+						// again as a perfect-match argument. Discount both, plus 1 to break the
+						// resulting tie, so an exact-arity overload wins.
+						score -= dummy_argument_count * (assign_score_function(0) + assign_score_function(1) + 1);
 						data->score = score;
 						data->result_type = final_proc_type->Proc.results;
 						data->gen_entity = gen_entity;
@@ -7037,6 +7093,11 @@ gb_internal CallArgumentError check_call_arguments_internal(CheckerContext *c, A
 	}
 
 	if (data) {
+		// A synthesised default argument is not evidence of a better match: it
+		// contributes assign_score_function(1) as a dummy bonus and is then scored
+		// again as a perfect-match argument. Discount both, plus 1 to break the
+		// resulting tie, so an exact-arity overload wins.
+		score -= dummy_argument_count * (assign_score_function(0) + assign_score_function(1) + 1);
 		data->score = score;
 		data->result_type = final_proc_type->Proc.results;
 		data->gen_entity = gen_entity;
@@ -7589,8 +7650,37 @@ gb_internal CallArgumentData check_call_arguments_proc_group(CheckerContext *c, 
 				array_add(&proc_entities, data.gen_entity);
 				index = proc_entities.count-1;
 
-				// prefer non-polymorphic procedures over polymorphic
-				item.score += assign_score_function(1);
+				// Order candidates:
+				//   value-polymorphic > concrete > specialized generic > unconstrained generic
+				//
+				// `proc($S: string)` specialises on a compile-time *value*
+				// `proc(x: $T)` specialises on a *type* and is a fallback, so it should lose
+				//  to an exact concrete overload
+				// `proc(x: $T/[]$E)` constrains that type, so it is the closer of the two
+				//
+				// These are small tie-breaks on purpose: assign_score_function(1) is
+				// ~a full perfect-match unit and would swamp argument match quality.
+				bool has_polymorphic_constant = false;
+				bool has_specialized_generic = false;
+				if (pt->Proc.params != nullptr) {
+					for (Entity *param : pt->Proc.params->Tuple.variables) {
+						if (param == nullptr) {
+							continue;
+						}
+						if (param->kind == Entity_Constant) {
+							has_polymorphic_constant = true;
+						}
+						Type *bt = base_type(param->type);
+						if (bt != nullptr && bt->kind == Type_Generic && bt->Generic.specialized != nullptr) {
+							has_specialized_generic = true;
+						}
+					}
+				}
+				if (has_polymorphic_constant) {
+					item.score += 2;
+				} else {
+					item.score += has_specialized_generic ? -1 : -2;
+				}
 			}
 
 			max_matched_features = gb_max(max_matched_features, matched_target_features(&pt->Proc));
@@ -9097,7 +9187,11 @@ gb_internal bool check_set_index_data(Operand *o, Type *t, bool indirection, i64
 		if (indirection) {
 			o->mode = Addressing_Variable;
 		} else if (o->mode != Addressing_Variable &&
+		           o->mode != Addressing_SoaVariable &&
 		           o->mode != Addressing_Constant) {
+			// NOTE: an #soa element of array type keeps SoaVariable, so soa[i][j] stays an
+			// lvalue. Its components are one per lane rather than contiguous, but a single
+			// component still has a real address, the same one soa[i].y denotes.
 			o->mode = Addressing_Value;
 		}
 		o->type = t->Array.elem;
@@ -12045,6 +12139,16 @@ gb_internal ExprKind check_slice_expr(CheckerContext *c, Operand *o, Ast *node, 
 	case Type_Array:
 		valid = true;
 		max_count = t->Array.count;
+		if (is_type_soa_pointer(o->type)) {
+			// #soa element pointer; the pointed element is scattered like soa[i] itself,
+			// so it can't be sliced through the ptr (nor directly -> soa[i][:] is also rejected below)
+			gbString str = expr_to_string(node);
+			error(node, "Cannot slice '%s' through an #soa pointer, element is not contiguous in memory", str);
+			gb_string_free(str);
+			o->mode = Addressing_Invalid;
+			o->expr = node;
+			return kind;
+		}
 		if (o->mode != Addressing_Variable && !is_type_pointer(o->type)) {
 			gbString str = expr_to_string(node);
 			error(node, "Cannot slice array '%s', value is not addressable", str);
@@ -12157,12 +12261,14 @@ gb_internal ExprKind check_slice_expr(CheckerContext *c, Operand *o, Ast *node, 
 		indices[i] = index;
 	}
 
+	bool invalid_indices = false;
 	for (isize i = 0; i < gb_count_of(indices); i++) {
 		i64 a = indices[i];
 		for (isize j = i+1; j < gb_count_of(indices); j++) {
 			i64 b = indices[j];
 			if (a > b && b >= 0) {
 				error(se->close, "Invalid slice indices: [%td > %td]", a, b);
+				invalid_indices = true;
 			}
 		}
 	}
@@ -12188,7 +12294,7 @@ gb_internal ExprKind check_slice_expr(CheckerContext *c, Operand *o, Ast *node, 
 
 	o->mode = Addressing_Value;
 
-	if (is_type_string(t) && max_count >= 0) {
+	if (is_type_string(t) && max_count >= 0 && !invalid_indices) {
 		bool all_constant = true;
 		for (isize i = 0; i < gb_count_of(nodes); i++) {
 			if (nodes[i] != nullptr) {
