@@ -68,6 +68,8 @@ gb_global Timings global_timings = {0};
 #include "parser.hpp"
 #include "checker.hpp"
 
+#include "asm_tables.cpp"
+
 #include "parser.cpp"
 #include "checker.cpp"
 #include "docs.cpp"
@@ -445,6 +447,7 @@ enum BuildFlagKind {
 	BuildFlag_DefaultToNilAllocator,
 	BuildFlag_DefaultToPanicAllocator,
 	BuildFlag_StrictStyle,
+	BuildFlag_StrictStylePackages,
 	BuildFlag_ForeignErrorProcedures,
 	BuildFlag_NoRTTI,
 	BuildFlag_DynamicMapCalls,
@@ -705,6 +708,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_DefaultToNilAllocator,   str_lit("default-to-nil-allocator"),  BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_DefaultToPanicAllocator, str_lit("default-to-panic-allocator"),BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_StrictStyle,             str_lit("strict-style"),              BuildFlagParam_None,    Command__does_check);
+	add_flag(&build_flags, BuildFlag_StrictStylePackages,     str_lit("strict-style-packages"),     BuildFlagParam_String,  Command__does_check);
 	add_flag(&build_flags, BuildFlag_ForeignErrorProcedures,  str_lit("foreign-error-procedures"),  BuildFlagParam_None,    Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_NoRTTI,                  str_lit("no-rtti"),                   BuildFlagParam_None,    Command__does_check);
@@ -1453,12 +1457,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								GB_ASSERT(value.kind == ExactValue_String);
 								String val = value.value_string;
 								String_Iterator it = {val, 0};
-								for (;;) {
-									String pkg = string_split_iterator(&it, ',');
-									if (pkg.len == 0) {
-										break;
-									}
-
+								String pkg = {};
+								while (string_split_iterator_next(&it, ',', &pkg)) {
 									pkg = string_trim_whitespace(pkg);
 									if (!string_is_valid_identifier(pkg)) {
 										gb_printf_err("-%.*s '%.*s' must be a valid identifier\n", LIT(name), LIT(pkg));
@@ -1476,12 +1476,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								GB_ASSERT(value.kind == ExactValue_String);
 								String val = value.value_string;
 								String_Iterator it = {val, 0};
-								for (;;) {
-									String attr = string_split_iterator(&it, ',');
-									if (attr.len == 0) {
-										break;
-									}
-
+								String attr = {};
+								while (string_split_iterator_next(&it, ',', &attr)) {
 									attr = string_trim_whitespace(attr);
 									if (!string_is_valid_identifier(attr)) {
 										gb_printf_err("-%.*s '%.*s' must be a valid identifier\n", LIT(name), LIT(attr));
@@ -1629,6 +1625,24 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							break;
 						case BuildFlag_StrictStyle:
 							build_context.strict_style = true;
+							break;
+						case BuildFlag_StrictStylePackages:
+							{
+								GB_ASSERT(value.kind == ExactValue_String);
+								String val = value.value_string;
+								String_Iterator it = {val, 0};
+								String pkg = {};
+								while (string_split_iterator_next(&it, ',', &pkg)) {
+									pkg = string_trim_whitespace(pkg);
+									if (!string_is_valid_identifier(pkg)) {
+										gb_printf_err("-%.*s '%.*s' must be a valid identifier\n", LIT(name), LIT(pkg));
+										bad_flags = true;
+										continue;
+									}
+
+									string_set_add(&build_context.strict_style_packages, pkg);
+								}
+							}
 							break;
 						case BuildFlag_Short:
 							build_context.cmd_doc_flags |= CmdDocFlag_Short;
@@ -3248,6 +3262,10 @@ gb_internal int print_show_help(String const arg0, String command, String option
 			print_usage_line(2, "Errs when the attached-brace style is not adhered to (also known as 1TBS).");
 			print_usage_line(2, "Errs when 'case' labels are not in the same column as the associated 'switch' token.");
 		}
+		if (print_flag("-strict-style-packages:<comma-separated-strings>")) {
+			print_usage_line(2, "Sets which packages by name will be checked against with '-strict-style'.");
+			print_usage_line(2, "Files with specific +vet tags will not be ignored if they are not in the packages set.");
+		}
 	}
 
 	if (run_or_build) {
@@ -3461,6 +3479,7 @@ gb_internal void print_show_unused(Checker *c) {
 		case Entity_ProcGroup:
 		case Entity_ImportName:
 		case Entity_LibraryName:
+		case Entity_AsmTemplate:
 			// Fine
 			break;
 		}
@@ -3794,6 +3813,13 @@ int main(int arg_count, char const **arg_ptr) {
 	defer (timings_destroy(&global_timings));
 
 	MAIN_TIME_SECTION("initialization");
+	// NOTE(Jeroen): Set codepage to UTF-8 (Windows only) and restore on exit.
+	//               Keep in mind this is for the compiler's own output only.
+	//               Like error messages on lines containing unicode.
+	//               Child processes will inherit the default codepage,
+	//               and so must do their own codepage management if they want.
+	set_utf8_codepage();
+	defer (restore_old_codepage());
 
 	init_string_interner();
 	init_global_error_collector();
@@ -4157,9 +4183,8 @@ int main(int arg_count, char const **arg_ptr) {
 	} else {
 		String march_list = target_microarch_list[build_context.metrics.arch];
 		String_Iterator it = {march_list, 0};
-		for (;;) {
-			String str = string_split_iterator(&it, ',');
-			if (str == "") break;
+		String str = {};
+		while (string_split_iterator_next(&it, ',', &str)) {
 			if (str == build_context.microarch) {
 				// Found matching microarch
 				print_microarch_list = false;
@@ -4184,9 +4209,8 @@ int main(int arg_count, char const **arg_ptr) {
 		String march_list  = target_microarch_list[build_context.metrics.arch];
 		String_Iterator it = {march_list, 0};
 
-		for (;;) {
-			String str = string_split_iterator(&it, ',');
-			if (str == "") break;
+		String str = {};
+		while (string_split_iterator_next(&it, ',', &str)) {
 			if (str == default_march) {
 				gb_printf("\t%.*s (default)\n", LIT(str));
 			} else {
@@ -4200,9 +4224,8 @@ int main(int arg_count, char const **arg_ptr) {
 	String default_features = get_default_features();
 	{
 		String_Iterator it = {default_features, 0};
-		for (;;) {
-			String str = string_split_iterator(&it, ',');
-			if (str == "") break;
+		String str = {};
+		while (string_split_iterator_next(&it, ',', &str)) {
 			string_set_add(&build_context.target_features_set, str);
 		}
 	}
@@ -4222,10 +4245,8 @@ int main(int arg_count, char const **arg_ptr) {
 
 	if (build_context.target_features_string.len != 0) {
 		String_Iterator target_it = {build_context.target_features_string, 0};
-		for (;;) {
-			String item = string_split_iterator(&target_it, ',');
-			if (item == "") break;
-			
+		String item = {};
+		while (string_split_iterator_next(&target_it, ',', &item)) {
 			String stripped_item = item;
 			if (*stripped_item.text == '+' || *stripped_item.text == '-') {
 				stripped_item.text++;
@@ -4242,9 +4263,8 @@ int main(int arg_count, char const **arg_ptr) {
 
 				String feature_list = target_features_list[build_context.metrics.arch];
 				String_Iterator it = {feature_list, 0};
-				for (;;) {
-					String str = string_split_iterator(&it, ',');
-					if (str == "") break;
+				String str = {};
+				while (string_split_iterator_next(&it, ',', &str)) {
 					if (check_single_target_feature_is_valid(default_features, str)) {
 						if (has_ansi_terminal_colours()) {
 							gb_printf("\t%.*s\x1b[38;5;244m (implied by target microarch %.*s)\x1b[0m\n", LIT(str), LIT(march));
@@ -4310,6 +4330,9 @@ int main(int arg_count, char const **arg_ptr) {
 	Parser * parser  = permanent_alloc_item<Parser>();
 	Checker *checker = permanent_alloc_item<Checker>();
 	bool failed_to_cache_parsing = false;
+
+	TIME_SECTION("init asm tables");
+	init_asm_tables(build_context.metrics.ptr_size);
 
 	MAIN_TIME_SECTION("parse files");
 

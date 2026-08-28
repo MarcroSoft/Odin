@@ -281,7 +281,7 @@ gb_internal bool check_custom_align(CheckerContext *ctx, Ast *node, i64 *align_,
 			}
 			i64 align = big_int_to_i64(&v);
 			if (align < 1 || !gb_is_power_of_two(cast(isize)align)) {
-				error(node, "#%s must be a power of 2, got %lld", msg, align);
+				error(node, "#%s must be a power of 2, got %lld", msg, cast(long long)align);
 				return false;
 			}
 			*align_ = align;
@@ -677,7 +677,9 @@ gb_internal void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *
 	
 	scope_reserve(ctx->scope, min_field_count);
 
-	if (st->is_raw_union && min_field_count > 1) {
+	// Even a one-field `#raw_union` must be marked. RISC-V psABI excludes unions from the hardware
+	// floating-point convention. `struct{union{f32}}` goes in `a0` where `struct{f32}` goes in `fa0`.
+	if (st->is_raw_union) {
 		struct_type->Struct.is_raw_union = true;
 		context = str_lit("struct #raw_union");
 	}
@@ -1118,6 +1120,13 @@ gb_internal void check_bit_field_type(CheckerContext *ctx, Type *bit_field_type,
 			gb_string_free(s);
 		}
 
+		if (o.mode == Addressing_Constant) {
+			convert_to_typed(ctx, &o, t_int);
+			if (o.mode == Addressing_Invalid) {
+				o.value = exact_value_i64(1);
+			}
+		}
+
 		ExactValue bit_size = o.value;
 
 		if (bit_size.kind != ExactValue_Integer) {
@@ -1368,7 +1377,7 @@ gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_t
 			gb_free(a, s.text);
 			return;
 		}
-		if (!check_representable_as_constant(c, iv, t, nullptr)) {
+		if (!check_representable_as_constant(c, jv, t, nullptr)) {
 			gbAllocator a = heap_allocator();
 			String s = big_int_to_string(a, &j);
 			gbString ts = type_to_string(t);
@@ -1388,7 +1397,7 @@ gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_t
 			if (lower > 0) {
 				actual_lower = 0;
 			} else if (lower < 0) {
-				error(bs->elem, "bit_set does not allow a negative lower bound (%lld) when an underlying type is set", lower);
+				error(bs->elem, "bit_set does not allow a negative lower bound (%lld) when an underlying type is set", cast(long long)lower);
 			}
 		}
 
@@ -1417,9 +1426,9 @@ gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_t
 		}
 		if (!is_valid) {
 			if (actual_lower != lower) {
-				error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required (internally the lower bound was changed to 0 as an underlying type was set)", bits, bits_required);
+				error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required (internally the lower bound was changed to 0 as an underlying type was set)", cast(long long)bits, cast(long long)bits_required);
 			} else {
-				error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required", bits, bits_required);
+				error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required", cast(long long)bits, cast(long long)bits_required);
 			}
 		}
 		
@@ -1479,7 +1488,7 @@ gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_t
 						lower_changed = true;
 					} else if (lower < 0) {
 						gbString s = type_to_string(elem);
-						error(bs->elem, "bit_set does not allow a negative lower bound (%lld) of the element type '%s' when an underlying type is set", lower, s);
+						error(bs->elem, "bit_set does not allow a negative lower bound (%lld) of the element type '%s' when an underlying type is set", cast(long long)lower, s);
 						gb_string_free(s);
 					}
 				}
@@ -1487,9 +1496,9 @@ gb_internal void check_bit_set_type(CheckerContext *c, Type *type, Type *named_t
 				if (upper - lower >= bits) {
 					i64 bits_required = upper-lower+1;
 					if (lower_changed) {
-						error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required (internally the lower bound was changed to 0 as an underlying type was set)", bits, bits_required);
+						error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required (internally the lower bound was changed to 0 as an underlying type was set)", cast(long long)bits, cast(long long)bits_required);
 					} else {
-						error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required", bits, bits_required);
+						error(bs->elem, "bit_set range is greater than %lld bits, %lld bits are required", cast(long long)bits, cast(long long)bits_required);
 					}
 				}
 
@@ -2991,6 +3000,11 @@ gb_internal void init_map_internal_types(Type *type) {
 }
 
 gb_internal void add_map_key_type_dependencies(CheckerContext *ctx, Type *key) {
+	if (build_context.bedrock) {
+		// the map runtime is declared '#+build !bedrock'
+		return;
+	}
+
 	key = core_type(key);
 
 	if (is_type_cstring(key)) {
@@ -3538,9 +3552,12 @@ gb_internal void check_array_type_internal(CheckerContext *ctx, Ast *e, Type **t
 			return;
 		}
 
+		// Track user input and recovery value seperate, since both could be '0'
+		bool count_recovered = false;
 		if (count < 0) {
 			error(at->count, "? can only be used in conjunction with compound literals");
 			count = 0;
+			count_recovered = true;
 		}
 
 
@@ -3562,7 +3579,12 @@ gb_internal void check_array_type_internal(CheckerContext *ctx, Ast *e, Type **t
 					// Ignore
 				} else if (count < 1 || !is_power_of_two(count)) {
 					*type = alloc_type_array(elem, count, generic_type);
-					if (ctx->disallow_polymorphic_return_types && count == 0) {
+					if (count_recovered) {
+						return;
+					}
+					// a polymorphic value used as the count is still unresolved while the
+					// signature is checked and reads as 0; only a written count is constant
+					if (ctx->disallow_polymorphic_return_types && o.mode != Addressing_Constant) {
 						return;
 					}
 					error(at->count, "Invalid length for #simd, expected a power of two length, got '%lld'", cast(long long)count);
@@ -4124,7 +4146,7 @@ gb_internal Type *check_type_expr(CheckerContext *ctx, Ast *e, Type *named_type)
 	}
 	#endif
 
-	if (type->kind == Type_Named && type->Named.base == nullptr || is_type_typed(type)) {
+	if (type->kind == Type_Named && base_type(type) == nullptr || is_type_typed(type)) {
 		add_type_and_value(ctx, e, Addressing_Type, type, empty_exact_value);
 	} else {
 		gbString name = type_to_string(type);

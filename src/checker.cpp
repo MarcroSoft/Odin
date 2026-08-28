@@ -1834,6 +1834,12 @@ retry:;
 		expr = we->cond->tav.value.value_bool ? we->x : we->y;
 		goto retry;
 	case_end;
+	case_ast_node(label, AsmLabelDecl, expr);
+		return entity_of_node(label->name);
+	case_end;
+	case_ast_node(at, AsmTemplate, expr);
+		return at->anonymous_entity;
+	case_end;
 	}
 	return nullptr;
 }
@@ -2682,6 +2688,7 @@ gb_internal void add_min_dep_type_info(Checker *c, Type *t) {
 		add_min_dep_type_info(c, alloc_type_pointer(bt->FixedCapacityDynamicArray.elem));
 		add_min_dep_type_info(c, alloc_type_array(bt->FixedCapacityDynamicArray.elem, bt->FixedCapacityDynamicArray.capacity));
 		add_min_dep_type_info(c, t_int);
+		break;
 
 	case Type_Enum:
 		add_min_dep_type_info(c, bt->Enum.base_type);
@@ -5060,6 +5067,24 @@ gb_internal void check_collect_value_decl(CheckerContext *c, Ast *decl) {
 				if (fl != nullptr) {
 					error(name, "Procedure groups are not allowed within a foreign block");
 				}
+			} else if (init->kind == Ast_AsmGroup) {
+				ast_node(ag, AsmGroup, init);
+				e = alloc_entity_proc_group(d->scope, token, nullptr);
+				e->ProcGroup.is_asm_group = true;
+				if (fl != nullptr) {
+					error(name, "Asm template groups are not allowed within a foreign block");
+				}
+			}else if (init->kind == Ast_AsmTemplate) {
+				if (c->scope->flags&ScopeFlag_Type) {
+					error(name, "Asm templates are not allowed within a struct");
+					continue;
+				}
+				ast_node(at, AsmTemplate, init);
+				e = alloc_entity_asm_template(d->scope, token, nullptr, init);
+				if (fl != nullptr) {
+					error(name, "Asm templates are not allowed within a foreign block");
+				}
+				d->init_expr = init;
 			} else {
 				e = alloc_entity_constant(d->scope, token, nullptr, empty_exact_value);
 			}
@@ -7355,24 +7380,24 @@ gb_internal void check_objc_context_provider_procedures(Checker *c) {
 
 		const char *self_param_err = "The @(objc_context_provider) procedure must take as a parameter a single pointer to the @(objc_type) value.";
 		if (proc.param_count != 1) {
-			error(proc_entity->token, self_param_err);
+			error(proc_entity->token, "%s", self_param_err);
 		}
 
 		Type *self_param = base_type(proc.params->Tuple.variables[0]->type);
 		if (self_param->kind != Type_Pointer) {
-			error(proc_entity->token, self_param_err);
+			error(proc_entity->token, "%s", self_param_err);
 		}
 
 		Type *self_type = base_named_type(self_param->Pointer.elem);
 		if (!internal_check_is_assignable_to(self_type, e->type) &&
 			!(e->TypeName.objc_ivar && internal_check_is_assignable_to(self_type, e->TypeName.objc_ivar))) {
-			error(proc_entity->token, self_param_err);
+			error(proc_entity->token, "%s", self_param_err);
 		}
 		if (proc.calling_convention != ProcCC_CDecl && proc.calling_convention != ProcCC_Contextless) {
-			error(e->token, self_param_err);
+			error(e->token, "%s", self_param_err);
 		}
 		if (proc.is_polymorphic) {
-			error(e->token, self_param_err);
+			error(e->token, "%s", self_param_err);
 		}
 	}
 }

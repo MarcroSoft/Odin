@@ -16,6 +16,41 @@ gb_global isize lb_global_type_info_member_offsets_index = 0;
 gb_global isize lb_global_type_info_member_usings_index  = 0;
 gb_global isize lb_global_type_info_member_tags_index    = 0;
 
+// A backend worker must not end the process: its siblings are still inside LLVM, and tearing the
+// process down under them is what turns a reported error into a crash. A failing worker records the
+// failure and returns; the driver exits once the pool has drained. Work stealing can run a task on
+// the main thread, so this must not depend on which thread is executing
+gb_global std::atomic<bool> lb_worker_failure;
+
+gb_internal void lb_record_worker_failure(void) {
+	lb_worker_failure.store(true, std::memory_order_release);
+}
+
+gb_internal void lb_exit_if_worker_failed(void) {
+	if (lb_worker_failure.load(std::memory_order_acquire)) {
+		exit_with_errors();
+	}
+}
+
+// Without a handler installed, LLVM prints an error of its own and calls exit(1) from whichever
+// thread it is on. 
+gb_internal void lb_llvm_diagnostic_handler(LLVMDiagnosticInfoRef di, void *) {
+	char *description = LLVMGetDiagInfoDescription(di);
+	defer (LLVMDisposeMessage(description));
+
+	switch (LLVMGetDiagInfoSeverity(di)) {
+	case LLVMDSError:
+		gb_printf_err("LLVM Error: %s\n", description);
+		lb_record_worker_failure();
+		break;
+	case LLVMDSWarning:
+		gb_printf_err("LLVM Warning: %s\n", description);
+		break;
+	default:
+		break;
+	}
+}
+
 gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 	lbModule *m = cast(lbModule *)data;
 	Checker *c = m->checker;
@@ -58,6 +93,7 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 
 	m->module_name = module_name;
 	m->ctx = LLVMContextCreate();
+	LLVMContextSetDiagnosticHandler(m->ctx, lb_llvm_diagnostic_handler, nullptr);
 	m->mod = LLVMModuleCreateWithNameInContext(m->module_name, m->ctx);
 	// m->debug_builder = nullptr;
 	if (build_context.no_plt) {
@@ -364,7 +400,7 @@ gb_internal void lb_loop_end(lbProcedure *p, lbLoopData const &data) {
 
 gb_internal void lb_make_global_private_const(LLVMValueRef global_data) {
 	LLVMSetLinkage(global_data, LLVMLinkerPrivateLinkage);
-	// LLVMSetUnnamedAddress(global_data, LLVMGlobalUnnamedAddr);
+	LLVMSetUnnamedAddress(global_data, LLVMGlobalUnnamedAddr);
 	LLVMSetGlobalConstant(global_data, true);
 }
 gb_internal void lb_make_global_private_const(lbAddr const &addr) {
@@ -2617,6 +2653,22 @@ gb_internal LLVMTypeRef lb_type_internal(lbModule *m, Type *type) {
 				return struct_type;
 			}
 
+			bool is_soa_struct = type->Struct.soa_kind != StructSoa_None;
+			LLVMTypeRef named_struct_type = nullptr;
+			if (is_soa_struct) {
+				// NOTE(bill): SOA structs are anonymous and may be recursive
+				// (e.g. `#soa[]T` where `T` itself contains a field of type
+				// `#soa[]T`). Register an opaque named struct up front so that any
+				// recursive field references resolve to it instead of recursing
+				// infinitely.
+				gbString soa_name = temp_canonical_string(type);
+				named_struct_type = LLVMGetTypeByName(m->mod, soa_name);
+				if (named_struct_type == nullptr) {
+					named_struct_type = LLVMStructCreateNamed(ctx, soa_name);
+				}
+				map_set(&m->types, type, named_struct_type);
+			}
+
 			lbStructFieldRemapping field_remapping = {};
 			slice_init(&field_remapping, permanent_allocator(), type->Struct.fields.count);
 
@@ -2655,7 +2707,17 @@ gb_internal LLVMTypeRef lb_type_internal(lbModule *m, Type *type) {
 				// so check the alignment of all fields to see if packing is required.
 				requires_packing = requires_packing || ((offset % type_align_of(field_type)) != 0);
 
-				array_add(&fields, lb_type(m, field_type));
+				LLVMTypeRef field_llvm_type = lb_type(m, field_type);
+
+				// `max_simd_align` can cap a member below what LLVM gives the lowered
+				// type. Unpacked, LLVM lays the struct out by its own alignment and the
+				// member moves: `struct{i8, #simd[8]f32}` is 48 bytes here and 64 to
+				// LLVM on every target that caps the vector at 16.
+				i64 natural_align = lb_llvm_natural_alignof(field_llvm_type);
+				requires_packing = requires_packing || ((offset % natural_align) != 0) ||
+				                   natural_align > full_type_align;
+
+				array_add(&fields, field_llvm_type);
 
 				prev_offset = offset + type_size_of(field->type);
 			}
@@ -2669,7 +2731,13 @@ gb_internal LLVMTypeRef lb_type_internal(lbModule *m, Type *type) {
 				GB_ASSERT(fields[i] != nullptr);
 			}
 
-			LLVMTypeRef struct_type = LLVMStructTypeInContext(ctx, fields.data, cast(unsigned)fields.count, requires_packing);
+			LLVMTypeRef struct_type = nullptr;
+			if (is_soa_struct) {
+				struct_type = named_struct_type;
+				LLVMStructSetBody(struct_type, fields.data, cast(unsigned)fields.count, requires_packing);
+			} else {
+				struct_type = LLVMStructTypeInContext(ctx, fields.data, cast(unsigned)fields.count, requires_packing);
+			}
 			map_set(&m->struct_field_remapping, cast(void *)struct_type, field_remapping);
 			map_set(&m->struct_field_remapping, cast(void *)type, field_remapping);
 			#if 0
@@ -2702,26 +2770,17 @@ gb_internal LLVMTypeRef lb_type_internal(lbModule *m, Type *type) {
 			if (is_type_union_maybe_pointer(type)) {
 				LLVMTypeRef variant = lb_type(m, type->Union.variants[0]);
 				array_add(&fields, variant);
-			} else if (type->Union.variants.count == 1) {
-				LLVMTypeRef block_type = lb_type(m, type->Union.variants[0]);
-
-				LLVMTypeRef tag_type = lb_type(m, union_tag_type(type));
-				array_add(&fields, block_type);
-				array_add(&fields, tag_type);
-				i64 used_size = lb_sizeof(block_type) + lb_sizeof(tag_type);
-				i64 padding = size - used_size;
-				if (padding > 0) {
-					LLVMTypeRef padding_type = lb_type_padding_filler(m, padding, align);
-					array_add(&fields, padding_type);
-				}
-				is_packed = true;
 			} else {
 				LLVMTypeRef block_type = lb_type_internal_union_block_type(m, type);
 
 				LLVMTypeRef tag_type = lb_type(m, union_tag_type(type));
 				array_add(&fields, block_type);
 				array_add(&fields, tag_type);
-				i64 used_size = lb_sizeof(block_type) + lb_sizeof(tag_type);
+				i64 block_size = lb_sizeof(block_type);
+				if (block_size == 0) {
+					block_size = type_size_of(type->Union.variants[0]);
+				}
+				i64 used_size = block_size + lb_sizeof(tag_type);
 				i64 padding = size - used_size;
 				if (padding > 0) {
 					LLVMTypeRef padding_type = lb_type_padding_filler(m, padding, align);
@@ -2972,6 +3031,10 @@ gb_internal void lb_add_nocapture_proc_attribute_at_index(lbProcedure *p, isize 
 
 gb_internal void lb_add_attribute_to_proc(lbModule *m, LLVMValueRef proc_value, char const *name, u64 value=0) {
 	LLVMAddAttributeAtIndex(proc_value, LLVMAttributeIndex_FunctionIndex, lb_create_enum_attribute(m->ctx, name, value));
+}
+
+gb_internal void lb_remove_attribute_from_proc(lbModule *m, LLVMValueRef proc_value, char const *name) {
+	LLVMRemoveEnumAttributeAtIndex(proc_value, LLVMAttributeIndex_FunctionIndex, LLVMGetEnumAttributeKindForName(name, gb_strlen(name)));
 }
 
 gb_internal bool lb_proc_has_attribute(lbModule *m, LLVMValueRef proc_value, char const *name) {
@@ -3786,7 +3849,7 @@ gb_internal lbValue lb_generate_global_array(lbModule *m, Type *elem_type, i64 c
 	g.type = alloc_type_pointer(t);
 	LLVMSetInitializer(g.value, LLVMConstNull(lb_type(m, t)));
 	LLVMSetLinkage(g.value, LLVMPrivateLinkage);
-	// LLVMSetUnnamedAddress(g.value, LLVMGlobalUnnamedAddr);
+	LLVMSetUnnamedAddress(g.value, LLVMGlobalUnnamedAddr);
 	string_map_set(&m->members, s, g);
 	return g;
 }

@@ -322,6 +322,76 @@ gb_internal IntegerDivisionByZeroKind lb_check_for_integer_division_by_zero_beha
 }
 
 
+// LLVM has srem(min(Integer_Type), -1) as UB and it raises an FP exception on a hardware
+// divide, yet `x % -1` is 0 for every x; `x srem 1` is 0 too and cannot trap, so a runtime
+// -1 divisor can be swapped for 1. Vectorizable.
+gb_internal LLVMValueRef lb_srem_safe_divisor(lbProcedure *p, LLVMValueRef rhs) {
+	LLVMValueRef minus_one = LLVMConstAllOnes(LLVMTypeOf(rhs));
+	// build 1 as neg(-1), this folds for both scalars and vectors
+	LLVMValueRef one = LLVMBuildNeg(p->builder, minus_one, "");
+	if (LLVMIsAConstantInt(rhs)) {
+		return rhs == minus_one ? one : rhs;
+	}
+	LLVMValueRef is_minus_one = LLVMBuildICmp(p->builder, LLVMIntEQ, rhs, minus_one, "");
+	return LLVMBuildSelect(p->builder, is_minus_one, one, rhs, "");
+}
+
+
+// implements %% (the remainder/floored mod operator) on signed integers;
+// this is branchless and vectorizable, so it also covers vectors
+gb_internal LLVMValueRef lb_emit_signed_floor_mod(lbProcedure *p, LLVMValueRef lhs, LLVMValueRef rhs) {	
+	// constants implement this as srem(srem(x, y) + y, y), which is mathematically correct,
+	// and works for arbitrary precision integers, but the add can wrap at finite precision
+
+	// the Odin spec mandates min(Integer_Type) %% -1 must be 0,
+	// a constant rhs = -1 can fold the whole operation, a runtime one is handled by the swap
+	if (LLVMIsAConstantInt(rhs) && rhs == LLVMConstAllOnes(LLVMTypeOf(rhs))) {
+		return LLVMConstNull(LLVMTypeOf(rhs)); // the entire %% op folds to 0
+	}
+	LLVMValueRef r = LLVMBuildSRem(p->builder, lhs, lb_srem_safe_divisor(p, rhs), "");
+	// srem truncs to 0, so r needs a +rhs correction when the operands signs differ (and r != 0)
+	// so we implement
+	// r = lhs % rhs
+	// if (r != 0 && sign(lhs) != sign(rhs))
+	// 	 return r + rhs
+	// else return r
+
+	// the sign of a const rhs is compile time known, which simplifies the correction to a mask
+	LLVMValueRef zero = LLVMConstNull(LLVMTypeOf(lhs));
+	if (LLVMIsAConstantInt(rhs)) {
+		// both operands are constant, so this folds
+		LLVMValueRef rhs_sign = LLVMBuildICmp(p->builder, LLVMIntSLT, rhs, zero, "");
+		// always true in current LLVM, only here for future proofing
+		if (LLVMIsAConstantInt(rhs_sign)) {
+			bool negative_rhs = !LLVMIsNull(rhs_sign);
+			// r has the sign of lhs (trunc mod), we use it here instead of lhs,
+			// cause the r = 0 case works out cleanly (-> mask = 0);
+			// correction only for (neg rhs and pos r) OR (pos rhs and neg r),
+			// so this is why we need to neg(r) for negative rhs;
+			// build mask by right extending the sign bit s >> bitwidth-1 (arithmetic shift)
+			// then r = r + (rhs & mask)
+			LLVMValueRef s = negative_rhs ? LLVMBuildNeg(p->builder, r, "") : r;
+			unsigned bitwidth = LLVMGetIntTypeWidth(LLVMTypeOf(lhs));
+			LLVMValueRef bits_to_shift = LLVMConstInt(LLVMTypeOf(lhs), bitwidth-1, false);
+			LLVMValueRef mask = LLVMBuildAShr(p->builder, s, bits_to_shift, "");
+			LLVMValueRef correction = LLVMBuildAnd(p->builder, rhs, mask, "");
+			return LLVMBuildAdd(p->builder, r, correction, "");
+		}
+	}
+
+	// this can only ever wrap when r and rhs have the same sign (cause |r| < |rhs|),
+	// and in that case the value is discarded in the select below (so no UB)
+	LLVMValueRef corrected = LLVMBuildAdd(p->builder, r, rhs, "");
+
+	// lhs^rhs is negative for differing signs and >=0 for equal signs
+	LLVMValueRef xored = LLVMBuildXor(p->builder, lhs, rhs, "");
+	LLVMValueRef different_signs = LLVMBuildICmp(p->builder, LLVMIntSLT, xored, zero, "");
+	LLVMValueRef r_is_non_zero = LLVMBuildICmp(p->builder, LLVMIntNE, r, zero, "");
+	LLVMValueRef cond = LLVMBuildAnd(p->builder, different_signs, r_is_non_zero, "");
+	return LLVMBuildSelect(p->builder, cond, corrected, r, "");
+}
+
+
 gb_internal bool is_simd_able_type(Type *t) {
 	if (t->kind != Type_Basic) {
 		return false;
@@ -430,18 +500,17 @@ gb_internal bool lb_try_direct_vector_arith(lbProcedure *p, TokenKind op, lbValu
 				}
 				break;
 			case Token_Mod:
-				{
-					auto *call = is_type_unsigned(integral_type) ? LLVMBuildURem : LLVMBuildSRem;
-					z = call(p->builder, x, y, "");
+				if (is_type_unsigned(integral_type)) {
+					z = LLVMBuildURem(p->builder, x, y, "");
+				} else {
+					z = LLVMBuildSRem(p->builder, x, lb_srem_safe_divisor(p, y), "");
 				}
 				break;
 			case Token_ModMod:
 				if (is_type_unsigned(integral_type)) {
 					z = LLVMBuildURem(p->builder, x, y, "");
 				} else {
-					LLVMValueRef a = LLVMBuildSRem(p->builder, x, y, "");
-					LLVMValueRef b = LLVMBuildAdd(p->builder, a, y, "");
-					z = LLVMBuildSRem(p->builder, b, y, "");
+					z = lb_emit_signed_floor_mod(p, x, y);
 				}
 				break;
 			case Token_And:
@@ -544,18 +613,17 @@ gb_internal bool lb_try_direct_vector_arith(lbProcedure *p, TokenKind op, lbValu
 				}
 				break;
 			case Token_Mod:
-				{
-					auto *call = is_type_unsigned(integral_type) ? LLVMBuildURem : LLVMBuildSRem;
-					z = call(p->builder, x, y, "");
+				if (is_type_unsigned(integral_type)) {
+					z = LLVMBuildURem(p->builder, x, y, "");
+				} else {
+					z = LLVMBuildSRem(p->builder, x, lb_srem_safe_divisor(p, y), "");
 				}
 				break;
 			case Token_ModMod:
 				if (is_type_unsigned(integral_type)) {
 					z = LLVMBuildURem(p->builder, x, y, "");
 				} else {
-					LLVMValueRef a = LLVMBuildSRem(p->builder, x, y, "");
-					LLVMValueRef b = LLVMBuildAdd(p->builder, a, y, "");
-					z = LLVMBuildSRem(p->builder, b, y, "");
+					z = lb_emit_signed_floor_mod(p, x, y);
 				}
 				break;
 			case Token_And:
@@ -1223,7 +1291,9 @@ gb_internal lbValue lb_emit_matrix_mul_vector(lbProcedure *p, lbValue lhs, lbVal
 			LLVMValueRef rhs_ptr = LLVMGetOperand(rhs.value, 0);
 			LLVMTypeRef vector_type = LLVMVectorType(lb_type(p->module, elem), cast(unsigned)vector_count);
 			LLVMValueRef rhs_vector = LLVMBuildLoad2(p->builder, vector_type, rhs_ptr, "");
-			LLVMSetAlignment(rhs_vector, cast(unsigned)type_align_of(type));
+			// The alignment of what is being loaded, which is the right-hand vector. `type` is the
+			// result, and asking it cannot be right except by coincidence.
+			LLVMSetAlignment(rhs_vector, cast(unsigned)type_align_of(vt));
 
 			for (unsigned i = 0; i < column_count; i++) {
 				LLVMValueRef mask = llvm_mask_same(p->module, i, row_count);
@@ -1612,16 +1682,14 @@ gb_internal LLVMValueRef lb_integer_modulo(lbProcedure *p, LLVMValueRef lhs, LLV
 			if (is_unsigned) {
 				return LLVMBuildURem(p->builder, lhs, rhs, "");
 			} else {
-				LLVMValueRef a = LLVMBuildSRem(p->builder, lhs, rhs, "");
-				LLVMValueRef b = LLVMBuildAdd(p->builder, a, rhs, "");
-				LLVMValueRef c = LLVMBuildSRem(p->builder, b, rhs, "");
-				return c;
+				return lb_emit_signed_floor_mod(p, lhs, rhs);
 			}
 		} else { // %
 			if (is_unsigned) {
 				return LLVMBuildURem(p->builder, lhs, rhs, "");
 			} else {
-				return LLVMBuildSRem(p->builder, lhs, rhs, "");
+				// min(Integer_Type) % -1 is 0, matching the constant folder, and must not trap
+				return LLVMBuildSRem(p->builder, lhs, lb_srem_safe_divisor(p, rhs), "");
 			}
 		}
 	};
@@ -2344,6 +2412,13 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 	// boolean -> boolean/integer
 	if (is_type_boolean(src) && (is_type_boolean(dst) || is_type_integer(dst))) {
 		LLVMValueRef b = LLVMBuildICmp(p->builder, LLVMIntNE, value.value, LLVMConstNull(lb_type(m, value.type)), "");
+		if (type_size_of(default_type(dst)) > 1 && is_type_different_to_arch_endianness(dst)) {
+			Type *platform_dst_type = integer_endian_type_to_platform_type(dst);
+			lbValue res = {};
+			res.value = LLVMBuildIntCast2(p->builder, b, lb_type(m, platform_dst_type), false, "");
+			res.type = t;
+			return lb_emit_byte_swap(p, res, t);
+		}
 		lbValue res = {};
 		res.value = LLVMBuildIntCast2(p->builder, b, lb_type(m, t), false, "");
 		res.type = t;
@@ -3144,7 +3219,7 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 		Type *elem = base_array_type(dst);
 		lbValue e = lb_emit_conv(p, value, elem);
 		lbAddr v = lb_add_local_generated(p, t, false);
-		lbValue zero = lb_const_value(p->module, elem, exact_value_i64(0), elem, LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
+		lbValue zero = lb_const_value(p->module, elem, exact_value_i64(0), LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
 		for (i64 j = 0; j < dst->Matrix.column_count; j++) {
 			for (i64 i = 0; i < dst->Matrix.row_count; i++) {
 				lbValue ptr = lb_emit_matrix_epi(p, v.addr, i, j);
@@ -3181,7 +3256,7 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 						lb_emit_store(p, d, s);
 					} else if (i == j) {
 						lbValue d = lb_emit_matrix_epi(p, v.addr, i, j);
-						lbValue s = lb_const_value(p->module, dst->Matrix.elem, exact_value_i64(1), dst->Matrix.elem, LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
+						lbValue s = lb_const_value(p->module, dst->Matrix.elem, exact_value_i64(1), LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
 						lb_emit_store(p, d, s);
 					}
 				}
@@ -3376,11 +3451,12 @@ gb_internal lbValue lb_emit_comp(lbProcedure *p, TokenKind op_kind, lbValue left
 
 	if (are_types_identical(a, b)) {
 		// NOTE(bill): No need for a conversion
-	} else if ((lb_is_const(left) && !is_type_array(left.type)) || lb_is_const_nil(left)) {
+	} else if ((lb_is_const(left) && !is_type_array(left.type) && !is_type_union(left.type)) || lb_is_const_nil(left)) {
 		// NOTE(karl): !is_type_array(left.type) is there to avoid lb_emit_conv
 		// trying to convert a constant array into a non-array. In that case we
 		// want the `else` branch to happen, so it can try to convert the
 		// non-array into an array instead.
+		// NOTE(korvahkh): We also need !is_type_union(left.type).
 
 		if (lb_is_const_nil(left)) {
 			if (internal_check_is_assignable_to(right.type, left.type)) {
@@ -3391,7 +3467,7 @@ gb_internal lbValue lb_emit_comp(lbProcedure *p, TokenKind op_kind, lbValue left
 			}
 		}
 		left = lb_emit_conv(p, left, right.type);
-	} else if ((lb_is_const(right) && !is_type_array(right.type)) || lb_is_const_nil(right)) {
+	} else if ((lb_is_const(right) && !is_type_array(right.type) && !is_type_union(right.type)) || lb_is_const_nil(right)) {
 
 		if (lb_is_const_nil(right)) {
 			if (internal_check_is_assignable_to(left.type, right.type)) {
@@ -3794,6 +3870,24 @@ gb_internal lbValue lb_emit_comp(lbProcedure *p, TokenKind op_kind, lbValue left
 			Type *pt = integer_endian_type_to_platform_type(left.type);
 			lhs = lb_emit_byte_swap(p, {lhs, pt}, pt).value;
 			rhs = lb_emit_byte_swap(p, {rhs, pt}, pt).value;
+		}
+
+		if (is_type_boolean(a) && is_type_boolean(b) && (op_kind == Token_CmpEq || op_kind == Token_NotEq)) {
+			// anything not 0 is true, which is what control flow already tests for
+			bool lhs_is_const = LLVMIsAConstantInt(lhs) != nullptr;
+			bool rhs_is_const = LLVMIsAConstantInt(rhs) != nullptr;
+			if (lhs_is_const != rhs_is_const) {
+				// against a literal, the truthiness test is the whole comparison
+				LLVMValueRef v = rhs_is_const ? lhs : rhs;
+				LLVMValueRef c = rhs_is_const ? rhs : lhs;
+				bool is_true = LLVMConstIntGetZExtValue(c) != 0;
+				pred = ((op_kind == Token_CmpEq) == is_true) ? LLVMIntNE : LLVMIntEQ;
+				lhs = v;
+				rhs = LLVMConstNull(LLVMTypeOf(v));
+			} else {
+				lhs = LLVMBuildICmp(p->builder, LLVMIntNE, lhs, LLVMConstNull(LLVMTypeOf(lhs)), "");
+				rhs = LLVMBuildICmp(p->builder, LLVMIntNE, rhs, LLVMConstNull(LLVMTypeOf(rhs)), "");
+			}
 		}
 
 		res.value = LLVMBuildICmp(p->builder, pred, lhs, rhs, "");
@@ -4399,20 +4493,6 @@ gb_internal lbValue lb_build_expr(lbProcedure *p, Ast *expr) {
 	return res;
 }
 
-gb_internal Type *lb_build_expr_original_const_type(Ast *expr) {
-	expr = unparen_expr(expr);
-	Type *type = type_of_expr(expr);
-	if (is_type_union(type)) {
-		if (expr->kind == Ast_CallExpr) {
-			if (expr->CallExpr.proc->tav.mode == Addressing_Type) {
-				Type *res = lb_build_expr_original_const_type(expr->CallExpr.args[0]);
-				return res;
-			}
-		}
-	}
-	return type_of_expr(expr);
-}
-
 gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 	lbModule *m = p->module;
 
@@ -4425,9 +4505,8 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 
 
 	if (tv.value.kind != ExactValue_Invalid) {
-		Type *original_type = lb_build_expr_original_const_type(expr);
 		// NOTE(bill): Short on constant values
-		return lb_const_value(p->module, type, tv.value, original_type, LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
+		return lb_const_value(p->module, type, tv.value, LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
 	} else if (tv.mode == Addressing_Type) {
 		// NOTE(bill, 2023-01-16): is this correct? I hope so at least
 		return lb_typeid(m, tv.type);
@@ -4508,7 +4587,7 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 		TypeAndValue tav = type_and_value_of_expr(expr);
 		GB_ASSERT(tav.mode == Addressing_Constant);
 
-		return lb_const_value(p->module, type, tv.value, tv.type, LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
+		return lb_const_value(p->module, type, tv.value, LB_CONST_CONTEXT_DEFAULT_ALLOW_LOCAL);
 	case_end;
 
 	case_ast_node(se, SelectorCallExpr, expr);
@@ -4542,6 +4621,9 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 		if (is_type_internally_pointer_like(type)) {
 			incoming_values[0] = LLVMBuildBitCast(p->builder, incoming_values[0], llvm_type, "");
 		}
+		// A union constant is built as an anonymous packed struct, which a phi cannot accept
+		// alongside the named type it results in, even though the two are laid out identically
+		incoming_values[0] = OdinLLVMBuildTransmute(p, incoming_values[0], llvm_type);
 
 		lb_emit_jump(p, done);
 		lb_start_block(p, else_);
@@ -4551,6 +4633,7 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 		if (is_type_internally_pointer_like(type)) {
 			incoming_values[1] = LLVMBuildBitCast(p->builder, incoming_values[1], llvm_type, "");
 		}
+		incoming_values[1] = OdinLLVMBuildTransmute(p, incoming_values[1], llvm_type);
 
 		lb_emit_jump(p, done);
 		lb_start_block(p, done);
@@ -4735,39 +4818,6 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 	case_ast_node(ie, MatrixIndexExpr, expr);
 		return lb_addr_load(p, lb_build_addr(p, expr));
 	case_end;
-
-	case_ast_node(ia, InlineAsmExpr, expr);
-		Type *t = type_of_expr(expr);
-		GB_ASSERT(is_type_asm_proc(t));
-
-		String asm_string = {};
-		String constraints_string = {};
-
-		TypeAndValue tav;
-		tav = type_and_value_of_expr(ia->asm_string);
-		GB_ASSERT(is_type_string(tav.type));
-		GB_ASSERT(tav.value.kind == ExactValue_String);
-		asm_string = tav.value.value_string;
-
-		tav = type_and_value_of_expr(ia->constraints_string);
-		GB_ASSERT(is_type_string(tav.type));
-		GB_ASSERT(tav.value.kind == ExactValue_String);
-		constraints_string = tav.value.value_string;
-
-
-		LLVMInlineAsmDialect dialect = LLVMInlineAsmDialectATT;
-		switch (ia->dialect) {
-		case InlineAsmDialect_Default: dialect = LLVMInlineAsmDialectATT;   break;
-		case InlineAsmDialect_ATT:     dialect = LLVMInlineAsmDialectATT;   break;
-		case InlineAsmDialect_Intel:   dialect = LLVMInlineAsmDialectIntel; break;
-		default: GB_PANIC("Unhandled inline asm dialect"); break;
-		}
-
-		LLVMTypeRef func_type = lb_type_internal_for_procedures_raw(p->module, t);
-		LLVMValueRef the_asm = llvm_get_inline_asm(func_type, asm_string, constraints_string, ia->has_side_effects, ia->has_side_effects, dialect);
-		GB_ASSERT(the_asm != nullptr);
-		return {the_asm, t};
-	case_end;
 	}
 
 	GB_PANIC("lb_build_expr: %.*s", LIT(ast_strings[expr->kind]));
@@ -4820,7 +4870,7 @@ gb_internal lbAddr lb_build_addr_from_entity(lbProcedure *p, Entity *e, Ast *exp
 	GB_ASSERT(e != nullptr);
 	if (e->kind == Entity_Constant) {
 		Type *t = default_type(type_of_expr(expr));
-		lbValue v = lb_const_value(p->module, t, e->Constant.value, e->type, LB_CONST_CONTEXT_DEFAULT_NO_LOCAL);
+		lbValue v = lb_const_value(p->module, t, e->Constant.value, LB_CONST_CONTEXT_DEFAULT_NO_LOCAL);
 		if (LLVMIsConstant(v.value)) {
 			lbAddr g = lb_add_global_generated_from_procedure(p, t, v);
 			return g;
@@ -6526,6 +6576,11 @@ gb_internal lbAddr lb_build_addr_internal(lbProcedure *p, Ast *expr) {
 		return lb_build_addr_from_entity(p, e, expr);
 	case_end;
 
+	case_ast_node(bd, BasicDirective, expr);
+		lbValue ptr = lb_address_from_load_or_generate_local(p, lb_build_expr(p, expr));
+		return lb_addr(ptr);
+	case_end;
+
 	case_ast_node(se, SelectorExpr, expr);
 		Ast *sel_node = unparen_expr(se->selector);
 		if (sel_node->kind == Ast_Ident) {
@@ -6737,7 +6792,9 @@ gb_internal lbAddr lb_build_addr_internal(lbProcedure *p, Ast *expr) {
 
 	case_ast_node(ue, UnaryExpr, expr);
 		switch (ue->op.kind) {
-		case Token_And: {
+		case Token_And:
+		case Token_Sub:
+		case Token_Add: {
 			lbValue ptr = lb_build_expr(p, expr);
 			return lb_addr(lb_address_from_load_or_generate_local(p, ptr));
 		}

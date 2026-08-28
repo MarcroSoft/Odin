@@ -1,3 +1,6 @@
+gb_internal LLVMValueRef lb_coerce_fields_load(lbProcedure *p, lbValue x, lbArgType const *arg);
+gb_internal LLVMValueRef lb_coerce_fields_store(lbProcedure *p, LLVMValueRef coerced, Type *original_type, lbArgType const *arg);
+
 gb_internal LLVMValueRef lb_call_intrinsic(lbProcedure *p, const char *name, LLVMValueRef* args, unsigned arg_count, LLVMTypeRef* types, unsigned type_count) {
 	unsigned id = LLVMLookupIntrinsicID(name, gb_strlen(name));
 	GB_ASSERT_MSG(id != 0, "Unable to find %s", name);
@@ -210,16 +213,22 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 	case ProcedureOptimizationMode_FavorSize:
 		lb_add_attribute_to_proc(m, p->value, "optsize");
 		break;
+	default:
+		// need optsize per proc for -o:size;
+		// (inliner, unroller, vectorizer, etc check it) 
+		if (build_context.optimization_level == OptimizationLevel_Size) {
+			lb_add_attribute_to_proc(m, p->value, "optsize");
+		}
+		break;
 	}
 
 	if (pt->Proc.enable_target_feature.len != 0) {
 		gbString feature_str = gb_string_make(temporary_allocator(), "");
 
 		String_Iterator it = {pt->Proc.enable_target_feature, 0};
+		String str = {};
 		bool first = true;
-		for (;;) {
-			String str = string_split_iterator(&it, ',');
-			if (str == "") break;
+		while (string_split_iterator_next(&it, ',', &str)) {
 			bool add_prefix = !(string_starts_with(str, '+') || string_starts_with(str, '-'));
 			if (!first) {
 				feature_str = gb_string_appendc(feature_str, ",");
@@ -681,7 +690,9 @@ gb_internal void lb_begin_procedure_body(lbProcedure *p) {
 					if (e->token.string.len != 0 && !is_blank_ident(e->token.string)) {
 						LLVMTypeRef param_type = lb_type(p->module, e->type);
 						LLVMValueRef original_value = LLVMGetParam(p->value, param_offset+llvm_param_index);
-						LLVMValueRef value = OdinLLVMBuildTransmute(p, original_value, param_type);
+						LLVMValueRef value = arg_type->coerce_offsets.count > 0
+							? lb_coerce_fields_store(p, original_value, e->type, arg_type)
+							: OdinLLVMBuildTransmute(p, original_value, param_type);
 
 						lbValue param = {};
 						param.value = value;
@@ -922,6 +933,60 @@ gb_internal Array<lbValue> lb_value_to_array(lbProcedure *p, gbAllocator const &
 
 
 
+// A `cast_type` is normally applied by reinterpreting the value's bits from offset zero. When the
+// ABI flattened an aggregate and dropped padding, the dense type it produced puts the survivors at
+// different offsets than they really have, and these two read and write them where they actually
+// live. See `lbArgType::coerce_offsets`.
+gb_internal LLVMValueRef lb_coerce_fields_load(lbProcedure *p, lbValue x, lbArgType const *arg) {
+	LLVMContextRef ctx = p->module->ctx;
+	LLVMTypeRef i8   = LLVMInt8TypeInContext(ctx);
+	LLVMTypeRef i64t = LLVMInt64TypeInContext(ctx);
+
+	lbValue base = lb_address_from_load_or_generate_local(p, x);
+
+	if (LLVMGetTypeKind(arg->cast_type) != LLVMStructTypeKind) {
+		GB_ASSERT(arg->coerce_offsets.count == 1);
+		LLVMValueRef index = LLVMConstInt(i64t, cast(unsigned long long)arg->coerce_offsets[0], false);
+		LLVMValueRef ptr   = LLVMBuildInBoundsGEP2(p->builder, i8, base.value, &index, 1, "");
+		return LLVMBuildLoad2(p->builder, arg->cast_type, ptr, "");
+	}
+
+	unsigned count = LLVMCountStructElementTypes(arg->cast_type);
+	GB_ASSERT(cast(isize)count == arg->coerce_offsets.count);
+	LLVMValueRef result = LLVMGetUndef(arg->cast_type);
+	for (unsigned i = 0; i < count; i += 1) {
+		LLVMTypeRef elem_type = LLVMStructGetTypeAtIndex(arg->cast_type, i);
+		LLVMValueRef index = LLVMConstInt(i64t, cast(unsigned long long)arg->coerce_offsets[i], false);
+		LLVMValueRef ptr   = LLVMBuildInBoundsGEP2(p->builder, i8, base.value, &index, 1, "");
+		LLVMValueRef elem  = LLVMBuildLoad2(p->builder, elem_type, ptr, "");
+		result = LLVMBuildInsertValue(p->builder, result, elem, i, "");
+	}
+	return result;
+}
+
+// The reverse: scatter a coerced value back into a full-sized object of the original type.
+gb_internal LLVMValueRef lb_coerce_fields_store(lbProcedure *p, LLVMValueRef coerced, Type *original_type, lbArgType const *arg) {
+	LLVMContextRef ctx = p->module->ctx;
+	LLVMTypeRef i8   = LLVMInt8TypeInContext(ctx);
+	LLVMTypeRef i64t = LLVMInt64TypeInContext(ctx);
+
+	lbAddr slot = lb_add_local_generated(p, original_type, true);
+
+	unsigned count = 1;
+	bool is_struct = LLVMGetTypeKind(arg->cast_type) == LLVMStructTypeKind;
+	if (is_struct) {
+		count = LLVMCountStructElementTypes(arg->cast_type);
+	}
+	GB_ASSERT(cast(isize)count == arg->coerce_offsets.count);
+	for (unsigned i = 0; i < count; i += 1) {
+		LLVMValueRef elem  = is_struct ? LLVMBuildExtractValue(p->builder, coerced, i, "") : coerced;
+		LLVMValueRef index = LLVMConstInt(i64t, cast(unsigned long long)arg->coerce_offsets[i], false);
+		LLVMValueRef ptr   = LLVMBuildInBoundsGEP2(p->builder, i8, slot.addr.value, &index, 1, "");
+		LLVMBuildStore(p->builder, elem, ptr);
+	}
+	return lb_addr_load(p, slot).value;
+}
+
 gb_internal lbValue lb_emit_call_internal(lbProcedure *p, lbValue value, lbValue return_ptr, Array<lbValue> const &processed_args, Type *abi_rt, lbAddr context_ptr, ProcInlining inlining, ProcTailing tailing) {
 	GB_ASSERT(p->module->ctx == LLVMGetTypeContext(LLVMTypeOf(value.value)));
 
@@ -1032,6 +1097,11 @@ gb_internal lbValue lb_emit_call_internal(lbProcedure *p, lbValue value, lbValue
 			LLVMAttributeRef attribute = ft->args[i].attribute;
 			if (attribute != nullptr) {
 				LLVMAddCallSiteAttribute(ret, param_offset, attribute);
+			}
+			// `byval`'s alignment decides the outgoing stack slot, and LLVM reads it
+			// from the CALL, not the declaration
+			if (ft->args[i].align_attribute != nullptr) {
+				LLVMAddCallSiteAttribute(ret, param_offset, ft->args[i].align_attribute);
 			}
 			param_offset += 1;
 		}
@@ -1191,7 +1261,10 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 				if (!abi_type) {
 					abi_type = arg->type;
 				}
-				if (xt == abi_type) {
+				if (arg->coerce_offsets.count > 0) {
+					x.value = lb_coerce_fields_load(p, x, arg);
+					array_add(&processed_args, x);
+				} else if (xt == abi_type) {
 					array_add(&processed_args, x);
 				} else {
 					x.value = OdinLLVMBuildTransmute(p, x.value, abi_type);
@@ -1261,10 +1334,14 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 			result = lb_emit_load(p, return_ptr);
 		} else if (rt != nullptr) {
 			result = lb_emit_call_internal(p, value, {}, processed_args, rt, context_ptr, inlining, tailing);
-			if (ft->ret.cast_type) {
-				result.value = OdinLLVMBuildTransmute(p, result.value, ft->ret.cast_type);
+			if (ft->ret.coerce_offsets.count > 0) {
+				result.value = lb_coerce_fields_store(p, result.value, rt, &ft->ret);
+			} else {
+				if (ft->ret.cast_type) {
+					result.value = OdinLLVMBuildTransmute(p, result.value, ft->ret.cast_type);
+				}
+				result.value = OdinLLVMBuildTransmute(p, result.value, ft->ret.type);
 			}
-			result.value = OdinLLVMBuildTransmute(p, result.value, ft->ret.type);
 			result.type = rt;
 			if (LLVMTypeOf(result.value) == LLVMInt1TypeInContext(p->module->ctx)) {
 				result.type = t_llvm_bool;
@@ -1563,19 +1640,44 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 				args[i] = arg.value;
 			}
 
-			gbString name = gb_string_make(heap_allocator(), "");
-			name = gb_string_append_fmt(name, "llvm.vector.interleave%d", n);
-			defer (gb_string_free(name));
+			// `llvm.vector.interleave<N>` is not usable across the supported targets: N > 2 does
+			// not exist before LLVM 22. Riscv & Darwin AMD64 has no `interleave2` either. 
+			// A shuffle is the one primitive every target has, and it expresses a two-way 
+			// interleave directly.
+			//
+			// The operand count is a power of two. The result is a riffle: pairing each operand 
+			// with the one a half-step away is what makes the order come out right, as
+			// interleave4(a,b,c,d) == interleave2(interleave2(a,c), interleave2(b,d)).
+			LLVMTypeRef llvm_u32 = lb_type(m, t_u32);
 
-			LLVMTypeRef types[1] = {lb_type(m, tv.type)};
-			res.value = lb_call_intrinsic(p, name, args, n, types, gb_count_of(types));
+			LLVMValueRef *cur = args;
+			for (int count = n; count > 1; /**/) {
+				int half = count/2;
+				unsigned width = LLVMGetVectorSize(LLVMTypeOf(cur[0]));
+
+				LLVMValueRef *mask = temporary_alloc_array<LLVMValueRef>(2*width);
+				for (unsigned i = 0; i < width; i++) {
+					mask[2*i + 0] = LLVMConstInt(llvm_u32, i,       false);
+					mask[2*i + 1] = LLVMConstInt(llvm_u32, width+i, false);
+				}
+				LLVMValueRef mask_value = LLVMConstVector(mask, 2*width);
+
+				LLVMValueRef *next = temporary_alloc_array<LLVMValueRef>(half);
+				for (int i = 0; i < half; i++) {
+					next[i] = LLVMBuildShuffleVector(p->builder, cur[i], cur[i+half], mask_value, "");
+				}
+
+				cur = next;
+				count = half;
+			}
+
+			res.value = cur[0];
 			return res;
 		}
 
 	case BuiltinProc_simd_deinterleave:
 		{
 			lbValue arg0 = lb_build_expr(p, ce->args[0]);
-			LLVMTypeRef types[1] = {lb_type(m, arg0.type)};
 
 			GB_ASSERT(ce->args[1]->tav.value.kind == ExactValue_Integer);
 			int n = cast(int)exact_value_to_i64(ce->args[1]->tav.value);
@@ -1585,11 +1687,27 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 				return res;
 			}
 
-			gbString name = gb_string_make(heap_allocator(), "");
-			name = gb_string_append_fmt(name, "llvm.vector.deinterleave%d", n);
-			defer (gb_string_free(name));
+			// `llvm.vector.deinterleave<N>` for N > 2 cannot be selected or legalized on most
+			// targets, only arm64 takes it. The split is done with shuffles, same as
+			// `simd_interleave`. Output `j` is the input strided by N starting at lane `j`.
+			LLVMTypeRef llvm_u32 = lb_type(m, t_u32);
+			LLVMTypeRef vector_type = LLVMTypeOf(arg0.value);
+			LLVMValueRef undef = LLVMGetUndef(vector_type);
 
-			res.value = lb_call_intrinsic(p, name, &arg0.value, 1, types, gb_count_of(types));
+			unsigned width = LLVMGetVectorSize(vector_type);
+			unsigned part  = width/cast(unsigned)n;
+
+			LLVMValueRef agg = LLVMGetUndef(lb_type(m, tv.type));
+			LLVMValueRef *mask = temporary_alloc_array<LLVMValueRef>(part);
+			for (int j = 0; j < n; j++) {
+				for (unsigned i = 0; i < part; i++) {
+					mask[i] = LLVMConstInt(llvm_u32, i*cast(unsigned)n + cast(unsigned)j, false);
+				}
+				LLVMValueRef lanes = LLVMBuildShuffleVector(p->builder, arg0.value, undef, LLVMConstVector(mask, part), "");
+				agg = LLVMBuildInsertValue(p->builder, agg, lanes, cast(unsigned)j, "");
+			}
+
+			res.value = agg;
 			return res;
 		}
 	}
@@ -5015,6 +5133,7 @@ gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr, lbVal
 
 	// NOTE(bill): Regular call
 	lbValue value = {};
+	Entity *asm_template = nullptr;
 
 	if (proc_entity != nullptr) {
 		if (proc_entity->flags & EntityFlag_Disabled) {
@@ -5048,15 +5167,25 @@ gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr, lbVal
 			}
 		}
 	}
+	Type *proc_value_type = nullptr;
 
 	if (is_objc_call) {
 		value.type = proc_tv.type;
+		proc_value_type = value.type;
 	} else if (value.value == nullptr) {
-		value = lb_build_expr(p, proc_expr);
+		Entity *found = entity_of_node(proc_expr);
+		if (found && found->kind == Entity_AsmTemplate) {
+			asm_template = found;
+			proc_value_type = asm_template->type;
+		} else {
+			value = lb_build_expr(p, proc_expr);
+			proc_value_type = value.type;
+		}
 	}
 
-	GB_ASSERT(value.value != nullptr || is_objc_call);
-	Type *proc_type_ = base_type(value.type);
+
+	GB_ASSERT(value.value != nullptr || is_objc_call || asm_template != nullptr);
+	Type *proc_type_ = base_type(proc_value_type);
 	GB_ASSERT(proc_type_->kind == Type_Proc);
 	TypeProc *pt = &proc_type_->Proc;
 
@@ -5275,6 +5404,11 @@ gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr, lbVal
 		}
 	}
 
-	return lb_emit_call(p, value, call_args, inlining, tailing, sret_dst);
+	if (asm_template != nullptr) {
+		GB_ASSERT(value.value == nullptr);
+		return lb_emit_asm_template_call(p, asm_template, call_args);
+	} else {
+		return lb_emit_call(p, value, call_args, inlining, tailing, sret_dst);
+	}
 }
 

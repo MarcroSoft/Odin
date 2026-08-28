@@ -418,7 +418,7 @@ static lbConstContext const LB_CONST_CONTEXT_DEFAULT_NO_LOCAL = {false, false, {
 
 gb_internal lbValue lb_const_nil(lbModule *m, Type *type);
 gb_internal lbValue lb_const_undef(lbModule *m, Type *type);
-gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, Type *value_type=nullptr, lbConstContext cc = LB_CONST_CONTEXT_DEFAULT);
+gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lbConstContext cc = LB_CONST_CONTEXT_DEFAULT);
 gb_internal lbValue lb_const_bool(lbModule *m, Type *type, bool value);
 gb_internal lbValue lb_const_int(lbModule *m, Type *type, u64 value);
 
@@ -466,6 +466,8 @@ gb_internal lbValue lb_emit_comp(lbProcedure *p, TokenKind op_kind, lbValue left
 gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> const &args, ProcInlining inlining = ProcInlining_none, ProcTailing tailing = ProcTailing_none, lbValue *sret_dst = nullptr);
 gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t);
 gb_internal lbValue lb_emit_comp_against_nil(lbProcedure *p, TokenKind op_kind, lbValue x);
+
+gb_internal lbValue lb_emit_asm_template_call(lbProcedure *p, Entity *entity, Array<lbValue> const &args);
 
 gb_internal void lb_emit_jump(lbProcedure *p, lbBlock *target_block);
 gb_internal void lb_emit_if(lbProcedure *p, lbValue cond, lbBlock *true_block, lbBlock *false_block);

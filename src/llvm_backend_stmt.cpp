@@ -1,6 +1,8 @@
 #define LB_ENABLE_BASIC_RVO    true
 #define LB_ENABLE_ADVANCED_RVO build_context.enable_rvo
 
+gb_internal LLVMValueRef lb_coerce_fields_load(lbProcedure *p, lbValue x, lbArgType const *arg);
+
 // NOTE(bill): @RVO Check if a call expression returns by sret with a return type matching dst_type.
 // Returns the callee's function type if eligible for copy elision, nullptr otherwise.
 gb_internal lbFunctionType *lb_call_sret_eligible(lbProcedure *p, Ast *call_expr, Type *dst_type) {
@@ -1740,7 +1742,13 @@ gb_internal void lb_build_unroll_range_stmt(lbProcedure *p, AstUnrollRangeStmt *
 					slice = lb_emit_load(p, slice);
 				} else {
 					count_ptr = lb_add_local_generated(p, t_int, false).addr;
-					lb_emit_store(p, count_ptr, lb_slice_len(p, slice));
+					if (t->kind == Type_Slice) {
+						lb_emit_store(p, count_ptr, lb_slice_len(p, slice));
+					} else if (t->kind == Type_DynamicArray) {
+						lb_emit_store(p, count_ptr, lb_dynamic_array_len(p, slice));
+					} else {
+						GB_ASSERT_MSG(false, "Need to add support for this type.");
+					}
 				}
 				data_ptr = lb_emit_struct_ev(p, slice, 0);
 				break;
@@ -2426,7 +2434,7 @@ gb_internal void lb_build_static_variables(lbProcedure *p, AstValueDecl *vd) {
 			if (e->Variable.is_rodata) {
 				cc.is_rodata = true;
 			}
-			value = lb_const_value(p->module, ast_value->tav.type, ast_value->tav.value, nullptr, cc);
+			value = lb_const_value(p->module, ast_value->tav.type, ast_value->tav.value, cc);
 		}
 
 		String mangled_name = {};
@@ -2581,7 +2589,9 @@ gb_internal void lb_build_return_stmt_internal(lbProcedure *p, lbValue res, Toke
 			ret_type = cast_type;
 		}
 
-		if (LLVMGetTypeKind(ret_type) == LLVMStructTypeKind) {
+		if (ft->ret.coerce_offsets.count > 0) {
+			ret_val = lb_coerce_fields_load(p, res, &ft->ret);
+		} else if (LLVMGetTypeKind(ret_type) == LLVMStructTypeKind) {
 			LLVMTypeRef src_type = LLVMTypeOf(ret_val);
 
 			if (p->temp_callee_return_struct_memory == nullptr) {
@@ -3380,7 +3390,10 @@ gb_internal void lb_build_stmt(lbProcedure *p, Ast *node) {
 					// NOTE(bill, 2023-02-17): lb_const_value might produce a stack local variable for the
 					// compound literal, so reusing that variable should minimize the stack wastage
 					lbAddr *comp_lit_addr = map_get(&p->module->exact_value_compound_literal_addr_map, rhs);
-					if (comp_lit_addr) {
+					// Only when the variable IS the literal. `x: U = []int{0}` declares a union and
+					// the literal is one of its variants, so reusing that storage would bind the
+					// variable to a bare `[]int` and never build the union at all
+					if (comp_lit_addr && are_types_identical(lb_addr_type(*comp_lit_addr), type_of_expr(vd->names[lval_index]))) {
 						if (Entity *e = entity_of_node(vd->names[lval_index])) {
 							lbValue val = comp_lit_addr->addr;
 							lb_add_entity(p->module, e, val);

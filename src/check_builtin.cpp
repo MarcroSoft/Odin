@@ -727,7 +727,7 @@ gb_internal bool check_builtin_objc_procedure(CheckerContext *c, Operand *operan
 		Type *superclass = obj_type->Named.type_name->TypeName.objc_superclass;
 		if (superclass == nullptr) {
 			gbString t = type_to_string(obj_type);
-			error(operand->expr, "'%.*s' target object '%.*s' does not have an Objective-C superclass. One must be set via the @(objc_superclass) attribute", LIT(builtin_name), t);
+			error(operand->expr, "'%.*s' target object '%s' does not have an Objective-C superclass. One must be set via the @(objc_superclass) attribute", LIT(builtin_name), t);
 			gb_string_free(t);
 			return false;
 		}
@@ -769,12 +769,12 @@ gb_internal bool check_builtin_c_procedure(CheckerContext *c, Operand *operand, 
 		Operand args = {};
 		check_expr(c, &args, ce->args[1]);
 		c->allow_c_vararg_param = false;
-		if (list.mode == Addressing_Invalid) {
+		if (args.mode == Addressing_Invalid) {
 			return false;
 		}
 		Entity *e = entity_of_node(args.expr);
 		if (e == nullptr || (e->flags & EntityFlag_CVarArg) == 0) {
-			error(list.expr, "'%.*s' expected a `#c_vararg` parameter", LIT(builtin_name));
+			error(args.expr, "'%.*s' expected a `#c_vararg` parameter", LIT(builtin_name));
 		}
 
 		operand->mode = Addressing_NoValue;
@@ -857,7 +857,7 @@ gb_internal bool check_builtin_c_procedure(CheckerContext *c, Operand *operand, 
 
 		Type *type = check_type(c, ce->args[1]);
 		if (type == nullptr || type == t_invalid) {
-			error(ce->args[1], "'%.*s' expected a type as the second parameter to intrinsics.%.*s", LIT(builtin_name));
+			error(ce->args[1], "'%.*s' expected a type as the second parameter", LIT(builtin_name));
 			return false;
 		}
 
@@ -947,6 +947,16 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 				error(x.expr, "'%.*s' is not supported for integer elements, got '%s'", LIT(builtin_name), xs);
 				gb_string_free(xs);
 				// don't return
+			}
+
+			if (id == BuiltinProc_simd_pairwise_add || id == BuiltinProc_simd_pairwise_sub) {
+				i64 lanes = get_array_type_count(x.type);
+				if (lanes % 2 != 0) {
+					gbString xs = type_to_string(x.type);
+					error(x.expr, "'%.*s' expected a #simd type with an even lane count, got '%s'", LIT(builtin_name), xs);
+					gb_string_free(xs);
+					return false;
+				}
 			}
 
 			operand->mode = Addressing_Value;
@@ -1292,11 +1302,7 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 			Type *elem = base_array_type(x.type);
 			i64 max_count = x.type->SimdVector.count;
 			i64 value = -1;
-			if (!check_index_value(c, x.type, false, ce->args[1], max_count, &value)) {
-				return false;
-			}
-			if (max_count < 0) {
-				error(ce->args[1], "'%.*s' expected a constant integer index, got '%lld'", LIT(builtin_name), cast(long long)value);
+			if (!check_index_value(c, &x, x.type, false, ce->args[1], max_count, &value)) {
 				return false;
 			}
 
@@ -1317,11 +1323,7 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 			Type *elem = base_array_type(x.type);
 			i64 max_count = x.type->SimdVector.count;
 			i64 value = -1;
-			if (!check_index_value(c, x.type, false, ce->args[1], max_count, &value)) {
-				return false;
-			}
-			if (max_count < 0) {
-				error(ce->args[1], "'%.*s' expected a constant integer index, got '%lld'", LIT(builtin_name), cast(long long)value);
+			if (!check_index_value(c, &x, x.type, false, ce->args[1], max_count, &value)) {
 				return false;
 			}
 
@@ -1520,13 +1522,19 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 			}
 
 			if (arg_count > max_count) {
-				error(call, "Too many '%.*s' indices, %td > %td", LIT(builtin_name), arg_count, max_count);
+				error(call, "Too many '%.*s' indices, %lld > %lld", LIT(builtin_name), cast(long long)arg_count, cast(long long)max_count);
 				return false;
 			}
 
 
 			if (!is_power_of_two(arg_count)) {
 				error(call, "'%.*s' must have a power of two index arguments, got %lld", LIT(builtin_name), cast(long long)arg_count);
+				return false;
+			}
+
+			// the result is as wide as the index list, which may be twice the operand width
+			if (arg_count > SIMD_ELEMENT_COUNT_MAX) {
+				error(call, "'%.*s' constructs a #simd vector beyond the maximum element count of %d, got %lld", LIT(builtin_name), SIMD_ELEMENT_COUNT_MAX, cast(long long)arg_count);
 				return false;
 			}
 
@@ -1785,12 +1793,13 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 			}
 			Operand offset = {};
 			check_expr(c, &offset, ce->args[1]); if (offset.mode == Addressing_Invalid) return false;
-			convert_to_typed(c, &offset, t_i64);
+			// `base:intrinsics` declares the offset as `int` and does not mark it #any_int
+			convert_to_typed(c, &offset, t_int);
 			if (!is_type_integer(offset.type) || offset.mode != Addressing_Constant) {
-				error(offset.expr, "'%.*s' expected a constant integer offset");
+				error(offset.expr, "'%.*s' expected a constant integer offset", LIT(builtin_name));
 				return false;
 			}
-			check_assignment(c, &offset, t_i64, builtin_name);
+			check_assignment(c, &offset, t_int, builtin_name);
 
 			operand->type = x.type;
 			operand->mode = Addressing_Value;
@@ -1915,9 +1924,15 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 			i64 base_count = get_array_type_count(x.type);
 			i64 count = base_count * cast(i64)ce->args.count;
 
-			i64 max_count = 64;
+			i64 max_count = SIMD_ELEMENT_COUNT_MAX;
 			if (count > max_count) {
-				error(ce->proc, "'%.*s' exceeds the maximum #simd count %lld, got %lld", cast(long long)max_count, cast(long long)count);
+				error(ce->proc, "'%.*s' exceeds the maximum #simd count %lld, got %lld", LIT(builtin_name), cast(long long)max_count, cast(long long)count);
+				return false;
+			}
+			// the lane count is the operand width times the argument count, so it is a power
+			// of two only when the argument count is
+			if (!is_power_of_two(count)) {
+				error(ce->proc, "'%.*s' must produce a power of two #simd count, got %lld", LIT(builtin_name), cast(long long)count);
 				return false;
 			}
 
@@ -3290,7 +3305,7 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		if (sel.indirect) {
 			gbString type_str = type_to_string_shorthand(type);
 			error(ce->args[0],
-			      "Field '%s' is embedded via a pointer in '%s'", field_name.string(), type_str);
+			      "Field '%.*s' is embedded via a pointer in '%s'", LIT(field_name.string()), type_str);
 			gb_string_free(type_str);
 			return false;
 		}
@@ -3491,11 +3506,9 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			arg_count++;
 		}
 
-		if (false && arg_count > max_count) {
-			error(call, "Too many 'swizzle' indices, %td > %td", arg_count, max_count);
-			return false;
-		} else if (arg_count < 2) {
-			error(call, "Not enough 'swizzle' indices, %td < 2", arg_count);
+		// No upper bound on the index count
+		if (arg_count < 2) {
+			error(call, "Not enough 'swizzle' indices, %lld < 2", cast(long long)arg_count);
 			return false;
 		}
 
@@ -3511,6 +3524,11 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 
 		if (is_type_simd_vector(type) && !is_power_of_two(arg_count)) {
 			error(call, "'swizzle' with a #simd vector must have a power of two arguments, got %lld", cast(long long)arg_count);
+			return false;
+		}
+
+		if (is_type_simd_vector(type) && arg_count > SIMD_ELEMENT_COUNT_MAX) {
+			error(call, "'swizzle' constructs a #simd vector beyond the maximum element count of %d, got %lld", SIMD_ELEMENT_COUNT_MAX, cast(long long)arg_count);
 			return false;
 		}
 
@@ -3586,7 +3604,13 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		default: GB_PANIC("Invalid type"); break;
 		}
 
-		if (type_hint != nullptr && check_is_castable_to(c, operand, type_hint)) {
+		// Only a complex hint of the same element type, or context-typing an untyped constant.
+		// Castability is the rule for a conversion the programmer wrote; used here it adopted any
+		// castable hint, which silently narrowed f64 to f32 and left the value with no element type
+		// at all when the hint was `any` or a union
+		if (type_hint != nullptr && is_type_complex(type_hint) &&
+		    (is_type_untyped(operand->type) ||
+		     are_types_identical(core_type(operand->type), core_type(type_hint)))) {
 			operand->type = type_hint;
 		}
 
@@ -3785,7 +3809,10 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		default: GB_PANIC("Invalid type"); break;
 		}
 
-		if (type_hint != nullptr && check_is_castable_to(c, operand, type_hint)) {
+		// see the note in BuiltinProc_complex
+		if (type_hint != nullptr && is_type_quaternion(type_hint) &&
+		    (is_type_untyped(operand->type) ||
+		     are_types_identical(core_type(operand->type), core_type(type_hint)))) {
 			operand->type = type_hint;
 		}
 
@@ -3849,10 +3876,6 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		default: GB_PANIC("Invalid type"); break;
 		}
 
-		if (type_hint != nullptr && check_is_castable_to(c, operand, type_hint)) {
-			operand->type = type_hint;
-		}
-
 		break;
 	}
 
@@ -3869,7 +3892,7 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		if (is_type_untyped(x->type)) {
 			if (x->mode == Addressing_Constant) {
 				if (is_type_numeric(x->type)) {
-					x->type = t_untyped_complex;
+					x->type = t_untyped_quaternion;
 				}
 			} else{
 				convert_to_typed(c, x, t_quaternion256);
@@ -3903,10 +3926,6 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		case Basic_UntypedComplex:    x->type = t_untyped_float; break;
 		case Basic_UntypedQuaternion: x->type = t_untyped_float; break;
 		default: GB_PANIC("Invalid type"); break;
-		}
-
-		if (type_hint != nullptr && check_is_castable_to(c, operand, type_hint)) {
-			operand->type = type_hint;
 		}
 
 		break;
@@ -4602,6 +4621,11 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		}
 		GB_ASSERT(!is_type_complex_or_quaternion(operand->type));
 
+		if (operand->mode == Addressing_Constant) {
+			operand->expr = call;
+			check_is_expressible(c, operand, operand->type);
+		}
+
 		break;
 	}
 
@@ -4917,11 +4941,11 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 					gb_string_free(s);
 				} else if (elements > MATRIX_ELEMENT_COUNT_MAX) {
 					gbString s = type_to_string(x.type);
-					error(call, "'%.*s' expects a matrix or array with a maximum of %d elements, got %s with %lld elements", LIT(builtin_name), MATRIX_ELEMENT_COUNT_MAX, s, elements);
+					error(call, "'%.*s' expects a matrix or array with a maximum of %d elements, got %s with %lld elements", LIT(builtin_name), MATRIX_ELEMENT_COUNT_MAX, s, cast(long long)elements);
 					gb_string_free(s);
 				} else if (elements > MATRIX_ELEMENT_COUNT_MAX) {
 					gbString s = type_to_string(x.type);
-					error(call, "'%.*s' expects a matrix or array with non-zero elements, got %s", LIT(builtin_name), MATRIX_ELEMENT_COUNT_MAX, s);
+					error(call, "'%.*s' expects a matrix or array with non-zero elements, got %s", LIT(builtin_name), s);
 					gb_string_free(s);
 				} else if (size > MATRIX_ELEMENT_MAX_SIZE) {
 					gbString s = type_to_string(x.type);
@@ -5206,6 +5230,12 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			operand->type = t_invalid;
 			return false;
 		}
+		convert_to_typed(c, &x, t_int);
+		if (x.mode == Addressing_Invalid) {
+			operand->mode = Addressing_Type;
+			operand->type = t_invalid;
+			return false;
+		}
 		i64 count = big_int_to_i64(&x.value.value_integer);
 
 		check_expr_or_type(c, &y, ce->args[1]);
@@ -5337,8 +5367,8 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			return false;
 		}
 		if (!is_type_integer(offset.type)) {
-			gbString s = type_to_string(array_ptr.type);
-			error(array_ptr.expr, "Expected an integer as the offset for '%.*s', got %s", s, LIT(builtin_name));
+			gbString s = type_to_string(offset.type);
+			error(offset.expr, "Expected an integer as the offset for '%.*s', got %s", LIT(builtin_name), s);
 			gb_string_free(s);
 			return false;
 		}
@@ -5806,7 +5836,7 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			i64 sz = type_size_of(x.type);
 			if (sz < 2) {
 				gbString xts = type_to_string(x.type);
-				error(x.expr, "Type passed to '%.*s' must be at least 2 bytes, got %s with size of %lld", LIT(builtin_name), xts, sz);
+				error(x.expr, "Type passed to '%.*s' must be at least 2 bytes, got %s with size of %lld", LIT(builtin_name), xts, cast(long long)sz);
 				gb_string_free(xts);
 			}
 
@@ -6638,12 +6668,12 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			}
 			i64 n = exact_value_to_i64(z.value);
 			if (n <= 0) {
-				error(z.expr, "Scale parameter in '%.*s' must be positive, got %lld", LIT(builtin_name), n);
+				error(z.expr, "Scale parameter in '%.*s' must be positive, got %lld", LIT(builtin_name), cast(long long)n);
 				return false;
 			}
 			i64 sz = 8*type_size_of(x.type);
 			if (n > sz) {
-				error(z.expr, "Scale parameter in '%.*s' is larger than the base integer bit width, got %lld, expected a maximum of %lld", LIT(builtin_name), n, sz);
+				error(z.expr, "Scale parameter in '%.*s' is larger than the base integer bit width, got %lld, expected a maximum of %lld", LIT(builtin_name), cast(long long)n, cast(long long)sz);
 				return false;
 			}
 
@@ -6994,6 +7024,13 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			if ((bt->Basic.flags & BasicFlag_Untyped) != 0) {
 				gbString t = type_to_string(operand->type);
 				error(operand->expr, "Expected a non-untyped integer type for '%.*s', got %s", LIT(builtin_name), t);
+				gb_string_free(t);
+				return false;
+			}
+
+			if (bt->Basic.kind == Basic_rune) {
+				gbString t = type_to_string(operand->type);
+				error(operand->expr, "Type %s does not have an unsigned integer mapping for '%.*s'", t, LIT(builtin_name));
 				gb_string_free(t);
 				return false;
 			}
@@ -7679,6 +7716,12 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 				return false;
 			}
 			
+			convert_to_typed(c, &x, t_int);
+			if (x.mode == Addressing_Invalid) {
+				operand->mode = Addressing_Type;
+				operand->type = t_invalid;
+				return false;
+			}
 			i64 index = big_int_to_i64(&x.value.value_integer);
 			if (index < 0 || index >= u->Union.variants.count) {
 				error(call, "Variant tag out of bounds index for '%.*s", LIT(builtin_name));
@@ -8349,6 +8392,10 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 				gbString t = type_to_string(type);
 				error(ce->args[0], "Expected a valid type for map keys for '%.*s', got %s", LIT(builtin_name), t);
 				gb_string_free(t);
+				return false;
+			}
+			if (build_context.bedrock) {
+				error(call, "'%.*s' is not available when using '-bedrock'", LIT(builtin_name));
 				return false;
 			}
 
