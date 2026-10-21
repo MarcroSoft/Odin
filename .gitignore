@@ -323,3 +323,6 @@ build/
 cmake-build*/
 CMakeLists.txt
 sandbox/
+vendor/lua/5.4/windows/lua.lib
+vendor/lua/5.4/windows/lua_bco.lib
+vendor/lua/5.4/windows/lua_full.lib
