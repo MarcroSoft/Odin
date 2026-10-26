@@ -15,7 +15,7 @@ LUA_WASM_LIB :: #config(LUA_WASM_LIB, "env.o")
 when LUA_SHARED {
 	when ODIN_OS == .Windows {
 		// LUA_SHARED does nothing special on windows
-		foreign import lib "windows/lua55dll.lib"
+		foreign import lib "windows/lua.lib"
 	} else when ODIN_OS == .Linux && ODIN_ARCH == .amd64 {
 		foreign import lib "linux/liblua55.so"
 	} else when ODIN_ARCH == .wasm32 || ODIN_ARCH == .wasm64p32 {
@@ -25,7 +25,7 @@ when LUA_SHARED {
 	}
 } else {
 	when ODIN_OS == .Windows {
-		foreign import lib "windows/lua55dll.lib"
+		foreign import lib "windows/lua.lib"
 	} else when ODIN_OS == .Linux && ODIN_ARCH == .amd64 {
 		foreign import lib "linux/liblua55.a"
 	} else when ODIN_ARCH == .wasm32 || ODIN_ARCH == .wasm64p32 {
